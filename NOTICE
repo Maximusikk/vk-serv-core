@@ -1,0 +1,54 @@
+VKTurn — NOTICE File
+====================
+
+This product includes software developed by third parties. 
+Below is the list of major components and their respective licenses.
+
+1. Hysteria 2
+   - License: MIT License
+   - Source: https://github.com/apernet/hysteria
+   - Copyright (c) 2022-2024 HyNetwork
+
+2. Xray-core
+   - License: Mozilla Public License Version 2.0 (MPL 2.0)
+   - Source: https://github.com/XTLS/Xray-core
+   - Copyright (c) 2020-2024 Project X
+
+3. hev-socks5-tunnel
+   - License: MIT License
+   - Source: https://github.com/heiher/hev-socks5-tunnel
+   - Copyright (c) 2020-2024 Heiher
+
+4. Pion WebRTC
+   - License: MIT License
+   - Source: https://github.com/pion/webrtc
+   - Copyright (c) 2023 Pion
+
+5. smux (Stream Multiplexer)
+   - License: MIT License
+   - Source: https://github.com/xtaci/smux
+   - Copyright (c) 2016-2024 Daniel Zheng
+
+6. vk-turn-proxy (Base)
+   - License: GNU General Public License v3.0 (GPL-3.0)
+   - Source: https://github.com/cacggghp/vk-turn-proxy
+   - Note: The Core server component of VKTurn is based on this project. 
+     In accordance with GPL-3.0, the modified source code of the Core component 
+     is made available alongside the releases.
+
+7. Android Jetpack Compose & Material Design
+   - License: Apache License 2.0
+   - Source: https://developer.android.com/jetpack
+
+8. ZXing Android Embedded
+   - License: Apache License 2.0
+   - Source: https://github.com/journeyapps/zxing-android-embedded
+
+9. JSch (Java Secure Channel)
+   - License: Revised BSD License
+   - Source: https://github.com/mwiede/jsch
+
+---
+Full license texts are available in the respective project repositories.
+For the complete source code of the VKTurn Core component, please refer to 
+the release assets or contact the project maintainers.
