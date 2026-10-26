@@ -31,8 +31,9 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
 export BOT_TOKEN=...                 # токен от @BotFather
-export VKTURN_API_URL=http://203.0.113.10:7000
+export VKTURN_API_URL=https://203.0.113.10:7000
 export VKTURN_ADMIN_TOKEN=...        # из /opt/vkturn/config.txt
+export VKTURN_ADMIN_PIN=...          # TLS_PIN= из /opt/vkturn/config.txt (hex, 64 символа)
 export ADMIN_IDS=123456789           # Telegram-id продавца (через запятую)
 python bot.py
 ```
@@ -42,6 +43,7 @@ python bot.py
 | `BOT_TOKEN` | да | | токен Telegram-бота |
 | `VKTURN_API_URL` | да | | адрес API без `/v1` |
 | `VKTURN_ADMIN_TOKEN` | да | | admin-токен сервера |
+| `VKTURN_ADMIN_PIN` | да | | SPKI-пин сертификата API (строчный hex, 64 символа): `VKTURN_ADMIN_PIN=` из вывода install.sh или `TLS_PIN=` из config.txt. Не совпал — бот не отправит токен |
 | `ADMIN_IDS` | нет | пусто | кто может покупать без проверки оплаты |
 | `DEFAULT_DAYS` | нет | `30` | срок по умолчанию |
 | `DB_PATH` | нет | `seller_bot.db` | локальная база «заказ → пользователь → ключ» |
@@ -63,5 +65,5 @@ python bot.py
 - Бот хранит связь «заказ → пользователь → ключ» у себя. Потеряете `seller_bot.db` — `/buy`
   по уже оплаченным заказам отдаст ключ только админу (чужим пользователям отказывает).
   Делайте бэкап файла.
-- Запросы к API идут по HTTP (без TLS, решение D0): admin-токен виден в сети, поэтому
-  запускайте бота на доверенном хосте и по возможности включите `-admin-allow`.
+- Запросы к API идут по HTTPS с проверкой пина: токен уходит только после сверки сертификата
+  с `VKTURN_ADMIN_PIN`. После `rotate-cert.sh --new-key` пин меняется — обновите переменную.

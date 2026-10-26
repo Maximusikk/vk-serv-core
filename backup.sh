@@ -1,5 +1,5 @@
 #!/bin/bash
-# VKTurn — бэкап (G4): sqlite .backup + users/ и config.txt, хранить 7 последних.
+# VKTurn — бэкап (G4): sqlite .backup + users/, config.txt и tls/ (сертификат+ключ), хранить 7 последних.
 #
 # Использование:
 #   sudo bash backup.sh              # разовый бэкап в /opt/vkturn/backups/
@@ -50,7 +50,20 @@ if [ -d "$INSTALL_DIR/users" ]; then
     chmod 750 "$STAGE/users"
 fi
 
-tar -czf "$OUT" -C "$STAGE" api.db config.txt users 2>/dev/null || tar -czf "$OUT" -C "$STAGE" api.db config.txt
+# TLS-сертификат и ключ (S6): без них на новом сервере сменит пин (ключ генерится заново),
+# приложения с запомненным пином (TOFU) перестанут подключаться.
+if [ -f "$INSTALL_DIR/tls/api.crt" ] && [ -f "$INSTALL_DIR/tls/api.key" ]; then
+    mkdir -p "$STAGE/tls"
+    cp -p "$INSTALL_DIR/tls/api.crt" "$INSTALL_DIR/tls/api.key" "$STAGE/tls/"
+    chmod 700 "$STAGE/tls"
+    chmod 644 "$STAGE/tls/api.crt"
+    chmod 600 "$STAGE/tls/api.key"
+fi
+
+TARLIST=(api.db config.txt)
+[ -d "$STAGE/users" ] && TARLIST+=(users)
+[ -d "$STAGE/tls" ] && TARLIST+=(tls)
+tar -czf "$OUT" -C "$STAGE" "${TARLIST[@]}"
 chmod 600 "$OUT"
 rm -rf "$STAGE"
 

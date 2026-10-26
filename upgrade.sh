@@ -71,7 +71,9 @@ if [ "$HAS_API" = "1" ]; then
     chmod +x "$TMP/api"
     HELP=$("$TMP/api" -h 2>&1 || true)
     grep -- "-bind" <<<"$HELP" >/dev/null || error "Скачанный vkturn-api без -bind — в релизе $VKSERV_VERSION старая сборка"
-    info "vkturn-api OK"
+    # TLS обязателен (контракт): API слушает только HTTPS, нужен флаг -tls-dir
+    grep -- "-tls-dir" <<<"$HELP" >/dev/null || error "Скачанный vkturn-api без -tls-dir — в релизе $VKSERV_VERSION старая сборка без TLS"
+    info "vkturn-api OK (TLS)"
 fi
 
 # ── Бэкап базы перед заменой (F11) ───────────────────────────────────────────
@@ -193,8 +195,32 @@ info "vkturn-server: running ✓"
 
 if [ "$HAS_API" = "1" ]; then
     systemctl is-active --quiet vkturn-api || rollback "vkturn-api не запустился"
-    curl -fsS --max-time 5 "http://127.0.0.1:$API_PORT/health" >/dev/null || rollback "vkturn-api не отвечает на /health"
-    info "vkturn-api: running ✓"
+    curl -fsS --max-time 5 -k "https://127.0.0.1:$API_PORT/health" >/dev/null || rollback "vkturn-api не отвечает на https://127.0.0.1:$API_PORT/health"
+    info "vkturn-api: running ✓ (https://127.0.0.1:$API_PORT)"
+
+    # TLS-пин (SHA-256 SPKI, hex64, НЕ секрет): источник 1 — сертификат tls/api.crt,
+    # источник 2 (запасной) — строка лога API (в логе может быть пин старого сертификата).
+    TLS_PIN=""
+    if [ -f "$INSTALL_DIR/tls/api.crt" ]; then
+        TLS_PIN=$(openssl x509 -in "$INSTALL_DIR/tls/api.crt" -pubkey -noout 2>/dev/null | \
+                  openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)
+        # sha256 пустого ввода = openssl не смог прочитать сертификат
+        [ "$TLS_PIN" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] && TLS_PIN=""
+    fi
+    if [ -z "$TLS_PIN" ]; then
+        TLS_PIN=$(grep -o 'TLS_PIN=[0-9a-f]\{64\}' "$LOG_DIR/api.log" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
+    fi
+    if [ -n "$TLS_PIN" ]; then
+        if grep -q '^TLS_PIN=' "$INSTALL_DIR/config.txt" 2>/dev/null; then
+            sed -i "s|^TLS_PIN=.*|TLS_PIN=$TLS_PIN|" "$INSTALL_DIR/config.txt"
+        else
+            echo "TLS_PIN=$TLS_PIN" >> "$INSTALL_DIR/config.txt"
+        fi
+        chmod 600 "$INSTALL_DIR/config.txt"
+        info "TLS-пин записан в $INSTALL_DIR/config.txt"
+    else
+        warn "Не удалось прочитать TLS-пин — проверь $LOG_DIR/api.log (строка TLS_PIN=...) и $INSTALL_DIR/tls/api.crt"
+    fi
 
     # Порты пользователей после перезапуска с новым шаблоном
     FAILED=$(systemctl list-units 'vkserv@*' --state=failed --no-legend 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
@@ -212,6 +238,16 @@ echo ""
 echo -e "${G}✅  VKTurn обновлён до $VKSERV_VERSION${N}"
 echo "   • Учёт трафика: в обе стороны, по данным самого сервера (обновление раз в 30 сек)"
 echo "   • Ключи привязываются к первому устройству; отвязка — в админке"
+if [ -n "${TLS_PIN:-}" ]; then
+    echo ""
+    echo -e "${W}TLS-пин сервера (нужен приложениям для проверки сертификата):${N}"
+    echo "   $TLS_PIN"
+    echo "   Он же записан в $INSTALL_DIR/config.txt (строка TLS_PIN=)."
+fi
+echo ""
+echo -e "${Y}[!] ВАЖНО: API теперь работает ТОЛЬКО по HTTPS (https://<IP>:$API_PORT).${N}"
+echo -e "${Y}    Обновите приложение-админку и перевыдайте ссылки пользователям:${N}"
+echo -e "${Y}    старые http-клиенты работать не будут.${N}"
 if [ "$HAS_API" = "1" ] && [ -f "$LOG_DIR/api.log" ]; then
     echo ""
     echo "Последние строки лога API:"

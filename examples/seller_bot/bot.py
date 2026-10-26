@@ -5,6 +5,8 @@
 свою проверку оплаты. По умолчанию покупать (/buy, /extend, /addtraffic) могут только ADMIN_IDS.
 
 Настройка — переменными окружения (см. README.md). Токены в логи не пишутся.
+API — только HTTPS с проверкой SPKI-пина (VKTURN_ADMIN_PIN, обязателен): токен уходит на
+сервер только после того, как сертификат совпал с пином.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
-from vkturn_client import GB, VKTurnClient, VKTurnError
+from vkturn_client import GB, PinMismatchError, VKTurnClient, VKTurnError, parse_pin
 
 log = logging.getLogger("seller_bot")
 
@@ -46,6 +48,9 @@ class Config:
         self.bot_token = os.environ["BOT_TOKEN"]
         self.api_url = os.environ["VKTURN_API_URL"]
         self.admin_token = os.environ["VKTURN_ADMIN_TOKEN"]
+        # SPKI-пин сертификата API (VKTURN_ADMIN_PIN= из вывода install.sh / TLS_PIN= в config.txt).
+        # Обязателен: без него бот не стартует (режима «без проверки сертификата» нет).
+        self.admin_pin = parse_pin(os.environ["VKTURN_ADMIN_PIN"])
         self.admin_ids = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
         self.open_purchases = os.environ.get("OPEN_PURCHASES") == "1"  # только для тестов!
         self.default_days = int(os.environ.get("DEFAULT_DAYS", "30"))
@@ -117,6 +122,11 @@ def split_args(raw: str | None) -> tuple[str | None, list[str]]:
 
 
 def explain(e: VKTurnError) -> str:
+    if isinstance(e, PinMismatchError):
+        # Токен не отправлен. Либо сертификат сервера сменили (rotate-cert.sh --new-key),
+        # либо соединение перехвачено. Пин в логе не секрет; токен не пишем.
+        log.error("TLS pin mismatch: expected %s, server presented %s", e.expected, e.actual)
+        return "Сервер VKTurn сейчас недоступен. Попробуйте позже."
     if e.status == 0:
         return "Сервер VKTurn сейчас недоступен. Попробуйте позже."
     if e.status == 404:
@@ -328,7 +338,12 @@ async def main() -> None:
         cfg = Config()
     except KeyError as e:
         raise SystemExit(f"Не задана переменная окружения {e.args[0]} (см. README.md)")
-    api = VKTurnClient(cfg.api_url, cfg.admin_token)
+    except ValueError as e:
+        raise SystemExit(f"Неверная настройка: {e}")
+    try:
+        api = VKTurnClient(cfg.api_url, cfg.admin_token, pin=cfg.admin_pin)
+    except ValueError as e:
+        raise SystemExit(f"Неверная настройка: {e}")
     store = Store(cfg.db_path)
     bot = Bot(cfg.bot_token)
     dp = Dispatcher()

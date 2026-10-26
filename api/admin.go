@@ -12,6 +12,9 @@ import (
 // ── Admin middleware ───────────────────────────────────────────────────────────
 
 // adminMiddleware проверяет X-Admin-Token для всех /admin/* роутов.
+// Порядок: allowlist → блокировка IP (до сверки токена) → сверка токена → учёт неудачи.
+// ≥ adminRateLimit неудач за окно с одного IP → 429 даже при верном токене;
+// успешные запросы лимит не тратят.
 func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// D2: опциональный allowlist по IP — до проверки токена (пустой список = разрешено всем)
@@ -19,13 +22,15 @@ func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			jsonError(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		ip := clientIP(r)
+		if s.adminAuthLimiter.blocked(ip) {
+			w.Header().Set("Retry-After", "60")
+			jsonError(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
 		token := r.Header.Get("X-Admin-Token")
 		if !secretEqual(token, s.cfg.AdminToken) {
-			if !s.adminAuthLimiter.allow(clientIP(r)) {
-				w.Header().Set("Retry-After", "60")
-				jsonError(w, "too many requests", http.StatusTooManyRequests)
-				return
-			}
+			s.adminAuthLimiter.record(ip)
 			jsonError(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -194,14 +199,21 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, resp)
 }
 
-// buildUserKeyLink (C2) — готовая ссылка vkturn://key/<host>/<KEY>.
+// buildUserKeyLink (C2) — готовая ссылка vkturn://key/<host>/<KEY>?pin=<TLSPin>.
 // Публичный адрес: флаг -public-url / переменная PUBLIC_URL, иначе bind-адрес по факту.
+// Пин (S3) добавляется параметром ?pin=, чтобы приложение проверило SPKI-пин сервера
+// до отправки ключа (контракт §1). Пин не секрет; если TLSPin пуст (сертификат не
+// создан — в норме не бывает после S1), ссылка строится без pin.
 func (s *Server) buildUserKeyLink(key string) string {
 	host := s.cfg.PublicURL
 	if host == "" {
 		host = "127.0.0.1:7000" // локальный фоллбэк; на сервере задаётся PUBLIC_URL
 	}
-	return "vkturn://key/" + host + "/" + key
+	link := "vkturn://key/" + host + "/" + key
+	if s.cfg.TLSPin != "" {
+		link += "?pin=" + s.cfg.TLSPin
+	}
+	return link
 }
 
 func nullIfEmpty(s string) any {
