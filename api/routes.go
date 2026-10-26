@@ -26,6 +26,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	reg("/admin/keys/create", s.adminMiddleware(s.handleAdminCreateKey))
 	reg("/admin/keys", s.adminMiddleware(s.handleAdminListKeys))
 	reg("/admin/vk", s.adminMiddleware(s.handleAdminPutVK))
+	reg("/admin/vk/links", s.adminMiddleware(s.handleAdminVKLinks))
 	reg("/admin/health", s.adminMiddleware(s.handleAdminHealth))
 	reg("/admin/keys/", s.adminMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimSuffix(r.URL.Path, "/")

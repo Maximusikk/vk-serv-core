@@ -55,12 +55,10 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Обнови приложение VKTurn — эта версия не поддерживается", http.StatusBadRequest)
 		return
 	}
-	// VK-звонок — забота сервера: берём из config.txt (обновляется update-vk.sh).
+	// VK-звонок — забота сервера: пул ссылок (VK_LINK из config.txt + таблица vk_links, см. vklinks.go).
 	// Ссылка от клиента — только запасной вариант для старых установок без VK_LINK.
-	if _, _, serverVK, err := s.readMainConfig(); err == nil && serverVK != "" {
-		req.VKLink = serverVK
-	}
-	if !strings.Contains(req.VKLink, "vk.") || !strings.Contains(req.VKLink, "call/join/") {
+	fallbackVK := req.VKLink
+	if len(s.vkPool()) == 0 && (!strings.Contains(fallbackVK, "vk.") || !strings.Contains(fallbackVK, "call/join/")) {
 		jsonError(w, "VK ссылка не настроена на сервере (запусти /opt/vkturn/update-vk.sh)", http.StatusServiceUnavailable)
 		return
 	}
@@ -126,9 +124,12 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Ссылка на VK-звонок: закреплена за ключом, новым ключам достаётся наименее загруженная
+	vkLink := s.assignVKLink(req.Key, fallbackVK)
+
 	// Уже активирован — отдаём конфиг повторно (переактивация тем же устройством)
 	if activatedAt != nil && existingPort != nil && existingToken != nil {
-		config, err := s.buildVkturnLink(req.Key, *existingPort, req.VKLink)
+		config, err := s.buildVkturnLink(req.Key, *existingPort, vkLink)
 		if err != nil {
 			jsonError(w, "failed to build config: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -175,7 +176,7 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── Генерируем vkturn:// ─────────────────────────────────────────────────
-	config, err := buildVkturnLinkRaw(serverIP, prov.Port, req.VKLink, prov.WrapPass, hy2Pass)
+	config, err := buildVkturnLinkRaw(serverIP, prov.Port, vkLink, prov.WrapPass, hy2Pass, s.cfg.TLSPin)
 	if err != nil {
 		jsonError(w, "failed to build config", http.StatusInternalServerError)
 		return
@@ -385,11 +386,13 @@ func (s *Server) buildVkturnLink(keyID string, port int, vkLink string) (string,
 	if err != nil {
 		return "", err
 	}
-	return buildVkturnLinkRaw(serverIP, port, vkLink, wrapPass, hy2Pass)
+	return buildVkturnLinkRaw(serverIP, port, vkLink, wrapPass, hy2Pass, s.cfg.TLSPin)
 }
 
 // buildVkturnLinkRaw собирает vkturn://v1/<base64json>.
-func buildVkturnLinkRaw(serverIP string, port int, vkLink, wrapPass, hy2Pass string) (string, error) {
+// pin (S3) — SPKI-пин API-сервера: кладётся в payload, чтобы клиент проверил
+// сертификат до отправки ключа (контракт §1). Пустой pin поле не добавляет.
+func buildVkturnLinkRaw(serverIP string, port int, vkLink, wrapPass, hy2Pass, pin string) (string, error) {
 	hy2Profile := fmt.Sprintf(
 		"hysteria2://%s@%s:%d?sni=%s&insecure=1#VKTurn",
 		hy2Pass, serverIP, 10443, serverIP, // hy2 всегда на 10443
@@ -400,6 +403,9 @@ func buildVkturnLinkRaw(serverIP string, port int, vkLink, wrapPass, hy2Pass str
 		"vk":      vkLink,
 		"pwd":     wrapPass,
 		"profile": hy2Profile,
+	}
+	if pin != "" {
+		cfg["pin"] = pin
 	}
 	raw, err := json.Marshal(cfg)
 	if err != nil {

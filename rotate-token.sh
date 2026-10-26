@@ -50,8 +50,8 @@ systemctl restart vkturn-api || true
 sleep 2
 
 # Проверка: новый токен принят, старый отвергнут. При сбое возвращаем старый.
-code_new=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-    -H "X-Admin-Token: $NEW" "http://127.0.0.1:$API_PORT/admin/health" || true)
+code_new=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -k \
+    -H "X-Admin-Token: $NEW" "https://127.0.0.1:$API_PORT/admin/health" || true)
 if [ "$code_new" != "200" ]; then
     warn "Новый токен не принят (HTTP $code_new) — возвращаю старый"
     put_token "$ENV_FILE" "$OLD"
@@ -59,8 +59,8 @@ if [ "$code_new" != "200" ]; then
     systemctl restart vkturn-api || true
     error "Токен не изменён. Лог: journalctl -u vkturn-api -n 30"
 fi
-code_old=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-    -H "X-Admin-Token: $OLD" "http://127.0.0.1:$API_PORT/admin/health" || true)
+code_old=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -k \
+    -H "X-Admin-Token: $OLD" "https://127.0.0.1:$API_PORT/admin/health" || true)
 [ "$code_old" = "401" ] || warn "Старый токен дал HTTP $code_old (ожидалось 401) — проверь вручную"
 
 info "Токен заменён в api.env и config.txt, vkturn-api перезапущен"

@@ -10,7 +10,7 @@
 #   3. На новом:    install.sh (https://raw.githubusercontent.com/Maximusikk/vk-serv-core/main/install.sh | bash)
 #      — сгенерирует СВОИ пароли, они будут перезаписаны шагом 4.
 #   4. На новом:    sudo bash restore.sh /root/vkturn-*.tar.gz
-#      — вернёт базу, config.txt, users/ и подгонит под config.txt пароли hysteria/vkserv и токены API.
+#      — вернёт базу, config.txt, users/, tls/ (сертификат+ключ) и подгонит под config.txt пароли hysteria/vkserv и токены API.
 #   5. В админке обновить serverUrl на новый IP (или в ссылках vkturn:// — у ключей ссылка
 #      содержит старый IP, пользователям нужно вставить ссылку заново или продавец разошлёт новые).
 #
@@ -36,7 +36,7 @@ TAR_LIST=$(tar -tzf "$1") || error "Архив повреждён: $1"
 grep -q "api.db" <<<"$TAR_LIST" || error "В архиве нет api.db"
 grep -q "config.txt" <<<"$TAR_LIST" || error "В архиве нет config.txt"
 
-warn "Восстановление перезапишет api.db, config.txt и users/ текущей установки"
+warn "Восстановление перезапишет api.db, config.txt, users/ и tls/ текущей установки"
 read -r -p "Продолжить? [y/N] " yn
 [ "$yn" = "y" ] || exit 1
 
@@ -50,9 +50,27 @@ tar -xzf "$1" -C "$STAGE"
 chmod 600 "$STAGE/api.db" "$STAGE/config.txt" 2>/dev/null || true
 
 step "Восстановление базы и конфига"
+# Старые WAL/SHM от прежней базы не должны применяться к восстановленному api.db
+rm -f "$INSTALL_DIR/api.db-wal" "$INSTALL_DIR/api.db-shm"
 cp "$STAGE/api.db" "$INSTALL_DIR/api.db"
 cp "$STAGE/config.txt" "$INSTALL_DIR/config.txt"
 chmod 600 "$INSTALL_DIR/api.db" "$INSTALL_DIR/config.txt"
+
+# TLS: сертификат и ключ из бэкапа (S6) — чтобы пин сервера не изменился после миграции.
+# Без пары (или без архива с tls/) остаётся прежний сертификат / создастся новый при старте API.
+TLS_RESTORED=0
+if [ -f "$STAGE/tls/api.crt" ] && [ -f "$STAGE/tls/api.key" ]; then
+    TLS_RESTORED=1
+    mkdir -p "$INSTALL_DIR/tls"
+    cp "$STAGE/tls/api.crt" "$INSTALL_DIR/tls/api.crt"
+    cp "$STAGE/tls/api.key" "$INSTALL_DIR/tls/api.key"
+    chmod 700 "$INSTALL_DIR/tls"
+    chmod 644 "$INSTALL_DIR/tls/api.crt"
+    chmod 600 "$INSTALL_DIR/tls/api.key"
+    info "TLS-сертификат и ключ восстановлены (каталог 700, api.key 600) — пин прежний"
+else
+    warn "В архиве нет пары tls/api.crt+api.key — ПИН ИЗМЕНИТСЯ (будет пин сертификата этого VPS): перепривяжите админку и перевыдайте ссылки vkturn://...?pin=..."
+fi
 
 if [ -d "$STAGE/users" ]; then
     mkdir -p "$INSTALL_DIR/users"
@@ -118,8 +136,51 @@ fi
 step "Перезапуск"
 systemctl daemon-reload
 systemctl restart vkturn-server vkturn-hy2 vkturn-api 2>/dev/null || true
-sleep 3
-systemctl is-active --quiet vkturn-api && info "vkturn-api: running ✓" || warn "vkturn-api не запустился — journalctl -u vkturn-api -n 20"
+
+# Порт API — из юнита (-port N), по умолчанию 7000
+# (именно « -port N», чтобы не спутать с -hy2-port)
+API_PORT=$(grep -oE -- '(^|[[:space:]])-port [0-9]+' /etc/systemd/system/vkturn-api.service 2>/dev/null | head -n1 | awk '{print $NF}' || true)
+[ -n "$API_PORT" ] || API_PORT=7000
+
+# Health по HTTPS (loopback, -k допустим только для 127.0.0.1), а не только systemctl is-active
+API_HEALTHY=0
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -fsS --max-time 5 -k "https://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
+        API_HEALTHY=1; break
+    fi
+    sleep 1
+done
+if [ "$API_HEALTHY" = "1" ]; then
+    info "vkturn-api: running ✓ (https://127.0.0.1:$API_PORT/health)"
+else
+    warn "vkturn-api не отвечает на https://127.0.0.1:$API_PORT/health — journalctl -u vkturn-api -n 20"
+fi
+
+# Пин пересчитываем из ТЕКУЩЕГО tls/api.crt: config.txt из архива мог принести чужой/старый TLS_PIN.
+NEW_PIN=""
+if [ -f "$INSTALL_DIR/tls/api.crt" ]; then
+    NEW_PIN=$(openssl x509 -in "$INSTALL_DIR/tls/api.crt" -pubkey -noout 2>/dev/null | \
+              openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)
+    [ "$NEW_PIN" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] && NEW_PIN=""
+fi
+if [ -n "$NEW_PIN" ]; then
+    OLD_PIN=$(cfg_get TLS_PIN)
+    if grep -q '^TLS_PIN=' "$INSTALL_DIR/config.txt"; then
+        sed -i "s|^TLS_PIN=.*|TLS_PIN=$NEW_PIN|" "$INSTALL_DIR/config.txt"
+    else
+        echo "TLS_PIN=$NEW_PIN" >> "$INSTALL_DIR/config.txt"
+    fi
+    chmod 600 "$INSTALL_DIR/config.txt"
+    info "TLS_PIN в config.txt: $NEW_PIN"
+    if [ -n "$OLD_PIN" ] && [ "$OLD_PIN" != "$NEW_PIN" ]; then
+        warn "Пин отличается от пина в бэкапе ($OLD_PIN) — перепривяжите админку и перевыдайте ссылки"
+    fi
+else
+    warn "Не удалось прочитать $INSTALL_DIR/tls/api.crt — TLS_PIN в config.txt не обновлён"
+fi
+if [ "$TLS_RESTORED" = "0" ]; then
+    warn "В архиве не было tls/ — пин изменился: перепривяжите админку (VKTURN_ADMIN_PIN) и перевыдайте ссылки пользователям"
+fi
 
 # API при старте сам пересоберёт шаблон vkserv@ и поднимет порты ключей с port IS NOT NULL
 RUNNING=$(systemctl list-units 'vkserv@*' --state=running --no-legend 2>/dev/null | wc -l)

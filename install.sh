@@ -163,6 +163,10 @@ sleep 1
 step "Создание директорий"
 mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/users" "$LOG_DIR"
 chmod 755 "$INSTALL_DIR"
+# Каталог TLS vkturn-api: сам API создаёт его при первом старте (S1: ensureCert),
+# здесь создаём заранее с правами 700 — ключ и сертификат не должны быть доступны другим юзерам.
+mkdir -p "$INSTALL_DIR/tls"
+chmod 700 "$INSTALL_DIR/tls"
 
 # Логи не должны съесть диск (F7)
 cat > /etc/logrotate.d/vkturn << EOF
@@ -211,13 +215,17 @@ if curl -fsIL --connect-timeout 15 "$API_URL" >/dev/null 2>&1 || wget -q --spide
     download "$API_URL" "$INSTALL_DIR/api"
     chmod +x "$INSTALL_DIR/api"
     verify_sha256 "$INSTALL_DIR/api" "vkturn-api-$ARCH_SUFFIX"
+    # TLS обязателен (контракт): API слушает только HTTPS, нужен флаг -tls-dir (как в upgrade.sh)
+    API_HELP=$("$INSTALL_DIR/api" -h 2>&1 || true)
+    grep -- "-tls-dir" <<<"$API_HELP" >/dev/null || \
+        error "Скачанный vkturn-api без -tls-dir — в релизе $VKSERV_VERSION нет TLS-сборки"
     API_INSTALLED=1
-    info "vkturn-api OK"
+    info "vkturn-api OK (TLS)"
 else
     warn "vkturn-api не найден в releases — админка недоступна (токены всё равно сохранены)"
 fi
 
-# ── TLS сертификат ────────────────────────────────────────────────────────────
+# ── TLS сертификат (для hysteria2; vkturn-api создаёт свой в $INSTALL_DIR/tls сам при первом старте) ──
 step "Генерация TLS сертификата"
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:P-256 \
@@ -404,13 +412,39 @@ else
     warn "vkserv не запустился. Лог: journalctl -u vkturn-server -n 20"
 fi
 
+TLS_PIN=""
+API_HEALTHY=0
 if [ "$API_INSTALLED" = "1" ]; then
     systemctl enable --now vkturn-api.service
-    sleep 1
-    if systemctl is-active --quiet vkturn-api.service; then
-        info "vkturn-api: running ✓ (http://$SERVER_IP:$API_PORT)"
+    # Дожидаемся health: API слушает только HTTPS, при первом старте генерирует
+    # сертификат в $INSTALL_DIR/tls (SAN = PUBLIC_URL, поэтому PUBLIC_URL должен быть задан выше).
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if curl -fsS --max-time 5 -k https://127.0.0.1:$API_PORT/health >/dev/null 2>&1; then
+            API_HEALTHY=1; break
+        fi
+        sleep 1
+    done
+    if [ "$API_HEALTHY" = "1" ]; then
+        info "vkturn-api: running ✓ (https://$SERVER_IP:$API_PORT)"
     else
-        warn "vkturn-api не запустился. Лог: journalctl -u vkturn-api -n 20"
+        warn "vkturn-api не отвечает на https://127.0.0.1:$API_PORT/health. Лог: journalctl -u vkturn-api -n 20"
+    fi
+
+    # SPKI-пин API (SHA-256 от SubjectPublicKeyInfo, строчный hex, НЕ секрет).
+    # Источник 1 — сам сертификат tls/api.crt, источник 2 (запасной) — строка лога API.
+    if [ -f "$INSTALL_DIR/tls/api.crt" ]; then
+        TLS_PIN=$(openssl x509 -in "$INSTALL_DIR/tls/api.crt" -pubkey -noout 2>/dev/null | \
+                  openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)
+        # sha256 пустого ввода = openssl не смог прочитать сертификат
+        [ "$TLS_PIN" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] && TLS_PIN=""
+    fi
+    if [ -z "$TLS_PIN" ]; then
+        TLS_PIN=$(grep -o 'TLS_PIN=[0-9a-f]\{64\}' "$LOG_DIR/api.log" 2>/dev/null | tail -n1 | cut -d= -f2 || true)
+    fi
+    if [ -n "$TLS_PIN" ]; then
+        info "TLS-пин API получен (записан в config.txt)"
+    else
+        warn "Не удалось прочитать TLS-пин — проверь $LOG_DIR/api.log (строка TLS_PIN=...)"
     fi
 
     # Учёт трафика ведёт сам vkturn-api (читает users/<port>.stats от server).
@@ -425,7 +459,7 @@ fi
 # ── Генерация vkturn:// ───────────────────────────────────────────────────────
 step "Генерация конфига для приложения"
 HY2_PROFILE="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${SERVER_IP}&insecure=1#${SERVER_NAME}"
-JSON="{\"n\":\"${SERVER_NAME}\",\"peer\":\"${SERVER_IP}:${VKSERV_PORT}\",\"vk\":\"${VK_LINK}\",\"pwd\":\"${WRAP_PASS}\",\"profile\":\"${HY2_PROFILE}\"}"
+JSON="{\"n\":\"${SERVER_NAME}\",\"peer\":\"${SERVER_IP}:${VKSERV_PORT}\",\"vk\":\"${VK_LINK}\",\"pwd\":\"${WRAP_PASS}\",\"profile\":\"${HY2_PROFILE}\"${TLS_PIN:+,\"pin\":\"${TLS_PIN}\"}}"
 B64=$(echo -n "$JSON" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 VKTURN_LINK="vkturn://v1/${B64}"
 
@@ -443,6 +477,7 @@ INTERNAL_SECRET=$INTERNAL_SECRET
 PORT_START=$PORT_START
 PORT_END=$PORT_END
 VKTURN_LINK=$VKTURN_LINK
+${TLS_PIN:+TLS_PIN=$TLS_PIN}
 EOF
 chmod 600 "$INSTALL_DIR/config.txt"
 
@@ -464,13 +499,33 @@ fi
 
 # Вывод без ANSI — для парсинга приложением
 printf 'VKTURN_ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
+if [ -n "$TLS_PIN" ]; then printf 'VKTURN_ADMIN_PIN=%s\n' "$TLS_PIN"; fi
 
 if [ "$API_INSTALLED" = "1" ]; then
     echo -e "${W}Admin token:${N} $ADMIN_TOKEN"
-    echo -e "${W}Создать ключ:${N}"
-    echo "  curl -X POST http://$SERVER_IP:$API_PORT/admin/keys/create \\"
+    if [ -n "$TLS_PIN" ]; then
+        # --pinnedpubkey принимает base64 того же SPKI-хэша, что в TLS_PIN (hex). Только openssl.
+        PIN_B64=""
+        if [ -f "$INSTALL_DIR/tls/api.crt" ]; then
+            PIN_B64=$(openssl x509 -in "$INSTALL_DIR/tls/api.crt" -pubkey -noout 2>/dev/null | \
+                      openssl pkey -pubin -outform DER 2>/dev/null | \
+                      openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null || true)
+        fi
+        if [ -z "$PIN_B64" ]; then
+            # Запасной путь: hex → байты встроенным printf (TLS_PIN — строго [0-9a-f]{64})
+            PIN_B64=$(printf "$(printf '%s' "$TLS_PIN" | sed 's/../\\x&/g')" | openssl base64 -A 2>/dev/null || true)
+        fi
+        PIN_FLAG="--pinnedpubkey sha256//${PIN_B64}"
+    else
+        PIN_FLAG=""
+    fi
+    echo -e "${W}Создать ключ:${N} (API — только HTTPS, соединение закрепляется пином)"
+    echo "  curl $PIN_FLAG -X POST https://$SERVER_IP:$API_PORT/admin/keys/create \\"
     echo "    -H 'X-Admin-Token: $ADMIN_TOKEN' \\"
     echo "    -d '{\"expires_days\":30,\"bytes_limit\":10737418240,\"notes\":\"user1\"}'"
+    if [ -n "$TLS_PIN" ] && [ -z "$PIN_B64" ]; then
+        echo "  (base64-пин для curl: openssl x509 -in $INSTALL_DIR/tls/api.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)"
+    fi
 fi
 
 echo ""

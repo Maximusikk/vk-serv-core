@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -93,10 +94,13 @@ type adminHealth struct {
 	OK          bool   `json:"ok"`
 	VKLinkOK    bool   `json:"vk_link_ok"`
 	VKLinkError string `json:"vk_link_error,omitempty"`
+	VKLinks     int    `json:"vk_links"`       // сколько ссылок в пуле
+	VKLinksOK   int    `json:"vk_links_alive"` // сколько из них отвечают
 	DiskFreeMB  int64  `json:"disk_free_mb"`
 	ActiveUnits int    `json:"active_vkserv"`
 	APIVersion  string `json:"api_version"`
 	UptimeSec   int64  `json:"uptime_sec"`
+	TLSPin      string `json:"tls_pin,omitempty"` // SPKI-пин сертификата API (S3, не секрет; пуст до создания сертификата)
 }
 
 var processStart = time.Now()
@@ -107,7 +111,7 @@ func (s *Server) handleAdminHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h := adminHealth{APIVersion: APIVersion, UptimeSec: int64(time.Since(processStart).Seconds())}
+	h := adminHealth{APIVersion: APIVersion, UptimeSec: int64(time.Since(processStart).Seconds()), TLSPin: s.cfg.TLSPin}
 
 	// VK-ссылка: формат + пробный запрос (VK отвечает на GET звонка редиректом/страницей).
 	_, _, vkLink, err := s.readMainConfig()
@@ -124,6 +128,26 @@ func (s *Server) handleAdminHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Пул ссылок: пробуем все параллельно. Сервер считается здоровым, если жива хотя бы одна.
+	pool := s.vkPool()
+	h.VKLinks = len(pool)
+	if len(pool) > 0 {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, l := range pool {
+			wg.Add(1)
+			go func(link string) {
+				defer wg.Done()
+				if s.probeVKLink(link) {
+					mu.Lock()
+					h.VKLinksOK++
+					mu.Unlock()
+				}
+			}(l)
+		}
+		wg.Wait()
+	}
+
 	// Свободное место на разделе установки
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(s.cfg.InstallDir, &st); err == nil {
@@ -134,7 +158,7 @@ func (s *Server) handleAdminHealth(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM keys WHERE port IS NOT NULL AND activated_at IS NOT NULL`).
 		Scan(&h.ActiveUnits)
 
-	h.OK = h.VKLinkOK && h.DiskFreeMB > 100
+	h.OK = (h.VKLinkOK || h.VKLinksOK > 0) && h.DiskFreeMB > 100
 	jsonOK(w, h)
 }
 

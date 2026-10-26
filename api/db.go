@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS port_counters (
 	start INTEGER NOT NULL,
 	total INTEGER NOT NULL
 );
+-- Дополнительные VK-ссылки (пул). Основная ссылка по-прежнему VK_LINK в config.txt (см. vklinks.go)
+CREATE TABLE IF NOT EXISTS vk_links (
+	link       TEXT PRIMARY KEY,
+	created_at INTEGER NOT NULL
+);
 `
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -66,6 +71,7 @@ CREATE TABLE IF NOT EXISTS port_counters (
 		`ALTER TABLE keys ADD COLUMN revoked_at INTEGER`,     // soft-revoke (C6): NULL = действующий
 		`ALTER TABLE keys ADD COLUMN last_unbind_at INTEGER`, // частота unbind (G6)
 		`ALTER TABLE keys ADD COLUMN duration_days INTEGER`,  // C5: срок в днях, отсчёт с первой активации (NULL = не ожидает активации)
+		`ALTER TABLE keys ADD COLUMN vk_link TEXT`,           // VK-звонок, закреплённый за ключом (пул ссылок); NULL = основная
 	} {
 		if _, err := d.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate %q: %w", stmt, err)

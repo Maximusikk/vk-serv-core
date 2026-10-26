@@ -16,6 +16,7 @@ type ipLimiter struct {
 	max    int
 	hits   map[string][]time.Time
 	lastGC time.Time
+	now    func() time.Time // источник времени (подменяется в тестах)
 }
 
 func newIPLimiter(max int, window time.Duration) *ipLimiter {
@@ -24,15 +25,13 @@ func newIPLimiter(max int, window time.Duration) *ipLimiter {
 		max:    max,
 		hits:   make(map[string][]time.Time),
 		lastGC: time.Now(),
+		now:    time.Now,
 	}
 }
 
-// allow регистрирует запрос с ip; false — лимит превышен.
-func (l *ipLimiter) allow(ip string) bool {
-	now := time.Now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+// freshLocked чистит окно: периодически выкидывает устаревшие IP из карты и
+// возвращает отметки ip, попадающие в окно. Вызывать под l.mu.
+func (l *ipLimiter) freshLocked(ip string, now time.Time) []time.Time {
 	// Периодическая чистка, чтобы карта не росла бесконечно
 	if now.Sub(l.lastGC) > 10*l.window {
 		for k, v := range l.hits {
@@ -50,12 +49,43 @@ func (l *ipLimiter) allow(ip string) bool {
 			fresh = append(fresh, t)
 		}
 	}
-	if len(fresh) >= l.max {
+	if len(fresh) == 0 {
+		delete(l.hits, ip)
+	} else {
 		l.hits[ip] = fresh
+	}
+	return fresh
+}
+
+// allow регистрирует запрос с ip; false — лимит превышен (используется для /activate).
+func (l *ipLimiter) allow(ip string) bool {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	fresh := l.freshLocked(ip, now)
+	if len(fresh) >= l.max {
 		return false
 	}
 	l.hits[ip] = append(fresh, now)
 	return true
+}
+
+// blocked — true, если с ip за окно уже набрано max событий (ничего не регистрирует).
+// Для админки: проверяется ДО сверки токена, поэтому при блокировке 429 получает и верный токен.
+func (l *ipLimiter) blocked(ip string) bool {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.freshLocked(ip, now)) >= l.max
+}
+
+// record регистрирует одно событие (для админки — неудачную попытку токена) с ip.
+func (l *ipLimiter) record(ip string) {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hits[ip] = append(l.freshLocked(ip, now), now)
 }
 
 func clientIP(r *http.Request) string {

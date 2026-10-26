@@ -39,6 +39,9 @@ type Config struct {
 	AdminAllowNets []*net.IPNet // разобранный AdminAllow
 
 	NotifyURL string // webhook продавца для уведомлений (G5); пусто = выключено
+
+	TLSDir string // каталог api.crt/api.key (S1); по умолчанию /opt/vkturn/tls
+	TLSPin string // SPKI-пин сертификата API: hex SHA-256, 64 символа (не секрет)
 }
 
 // envInt читает целочисленную переменную окружения (0 при отсутствии/ошибке).
@@ -69,6 +72,11 @@ func main() {
 	flag.IntVar(&cfg.MaxActive, "max-active", maxActive, "максимум живых портов vkserv (0 = без ограничения)")
 	flag.StringVar(&cfg.AdminAllow, "admin-allow", os.Getenv("ADMIN_ALLOW"), "IP/CIDR через запятую, с которых разрешён /admin/* (пусто = с любого IP)")
 	flag.StringVar(&cfg.NotifyURL, "notify-url", os.Getenv("NOTIFY_URL"), "webhook для уведомлений продавцу: VK-ссылка умерла, диск/порты на исходе (пусто = выключено)")
+	tlsDir := os.Getenv("TLS_DIR")
+	if tlsDir == "" {
+		tlsDir = defaultTLSDir
+	}
+	flag.StringVar(&cfg.TLSDir, "tls-dir", tlsDir, "каталог TLS-сертификата API (api.crt/api.key; создаётся при первом старте)")
 	flag.Parse()
 
 	nets, err := parseAllowList(cfg.AdminAllow)
@@ -83,6 +91,20 @@ func main() {
 	if cfg.InternalSecret == "" {
 		log.Fatal("INTERNAL_SECRET не задан (флаг -internal-secret или переменная INTERNAL_SECRET)")
 	}
+
+	// TLS (S1): сертификат создаётся при первом старте, без него API не запускается
+	var certHosts []string
+	if h := hostFromPublicURL(cfg.PublicURL); h != "" {
+		certHosts = append(certHosts, h)
+	}
+	if ip := net.ParseIP(cfg.BindAddr); ip != nil && !ip.IsUnspecified() {
+		certHosts = append(certHosts, cfg.BindAddr)
+	}
+	cert, err := ensureCert(cfg.TLSDir, certHosts)
+	if err != nil {
+		log.Fatalf("TLS: не удалось создать или прочитать сертификат в %s: %v (проверьте права каталога или флаг -tls-dir / TLS_DIR)", cfg.TLSDir, err)
+	}
+	cfg.TLSPin = spkiPin(cert.Leaf)
 
 	sqlDB, err := OpenDB(cfg.DBPath)
 	if err != nil {
@@ -111,10 +133,13 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    16 << 10,
+		TLSConfig:         serverTLSConfig(cert),
 	}
-	log.Printf("vkturn-api: слушаю %s (db=%s, порты %d..%d, dir=%s)",
-		addr, cfg.DBPath, cfg.PortStart, cfg.PortEnd, cfg.InstallDir)
-	log.Fatal(httpSrv.ListenAndServe())
+	log.Printf("vkturn-api: слушаю https://%s (db=%s, порты %d..%d, dir=%s, tls-dir=%s)",
+		addr, cfg.DBPath, cfg.PortStart, cfg.PortEnd, cfg.InstallDir, cfg.TLSDir)
+	log.Printf("vkturn-api: TLS_PIN=%s", cfg.TLSPin)
+	// Сертификат уже в TLSConfig — пути пустые
+	log.Fatal(httpSrv.ListenAndServeTLS("", ""))
 }
 
 func nowUnix() int64 { return time.Now().Unix() }
