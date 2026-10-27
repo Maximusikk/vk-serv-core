@@ -254,3 +254,192 @@ class VKTurnClient:
 
     async def revoke(self, key_id: str) -> dict:
         return await self._request("POST", f"/admin/keys/{key_id}/revoke")
+
+# --- Этап 2A/2C: нода, кластер, bundle-ссылка -----------------------------------------------
+
+import base64 as _b64
+import logging as _logging
+import sqlite3 as _sqlite3
+
+_log = _logging.getLogger("vkturn_client")
+
+
+class Node:
+    """Одна нода VKTurn под управлением бота-мастера (авторизация master-token, этап 2A).
+
+    api   — host:port API (например "203.0.113.10:7000"; "https://" дописывается, http запрещён);
+    pin   — SPKI-пин сертификата ноды (VKTURN_ADMIN_PIN/VKTURN_MASTER_PIN из вывода install.sh);
+    token — MASTER_TOKEN ноды (VKTURN_MASTER_TOKEN из вывода install.sh/upgrade.sh).
+
+    TLS-пин проверяется до отправки токена — наследует механику VKTurnClient.
+    """
+
+    def __init__(self, api: str, pin: str, token: str, *, name: str = "", timeout: float = 10.0):
+        self.name = name or api
+        url = api.strip()
+        if "://" not in url:
+            url = "https://" + url
+        parts = urlsplit(url)
+        if parts.scheme.lower() != "https":
+            raise ValueError("Node.api должен быть host:port (https подразумевается)")
+        if not parts.hostname:
+            raise ValueError("Node.api: не указан хост")
+        self.api = f"{parts.hostname}:{parts.port or 7000}"
+        self.pin = parse_pin(pin)
+        self._client = VKTurnClient(url, token, timeout, pin=self.pin)
+
+    async def create_key(self, *, external_id: str, bytes_limit: int = 0,
+                         local_limit: int = 0, expires_days: int = 0) -> dict:
+        """Создать ключ (этап 2A). local_limit — локальный стоп-кран ноды на случай
+        пропажи мастера. Идемпотентно по external_id."""
+        body: dict = {
+            "expires_days": expires_days,
+            "start": "on_activation",
+            "bytes_limit": bytes_limit,
+            "external_id": external_id,
+        }
+        if local_limit:
+            body["local_limit"] = local_limit
+        return await self._client._request("POST", "/admin/keys/create", json=body)
+
+    async def revoke(self, key_id: str) -> dict:
+        return await self._client.revoke(key_id)
+
+    async def get_key(self, key_id: str) -> dict:
+        return await self._client.get_key(key_id)
+
+    async def usage(self, since: int = 0, limit: int = 1000) -> dict:
+        """Дельты трафика по курсору (2A): {"items": [{key_id, external_id, bytes}], "next": <id>}."""
+        return await self._client._request("GET", "/admin/usage",
+                                           params={"since": since, "limit": limit})
+
+    async def health(self) -> dict:
+        return await self._client._request("GET", "/admin/health")
+
+
+def make_bundle(name: str, pairs, limit: int | None = None) -> str:
+    """Собирает vkturn://bundle/… (формат: _review/00d_protocol_map.md §1.3).
+
+    pairs — [(Node, key_id), ...]. Неизвестных полей не добавляем (этап 3 расширит).
+    """
+    servers = [{"api": node.api, "pin": node.pin, "key": key,
+                "name": getattr(node, "name", "") or node.api}
+               for node, key in pairs]
+    obj: dict = {"v": 1, "n": name, "s": servers}
+    if limit is not None:
+        obj["limit"] = int(limit)
+    raw = _json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "vkturn://bundle/" + _b64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+class Cluster:
+    """Мастер поверх нескольких нод: ключи с одним external_id на всех, сбор дельт
+    по курсорам (курсоры и соответствие external_id→key_id в SQLite), отзыв везде.
+    Курсор ноды двигается только после полного успешного забора — при сбое нода
+    отдаст те же записи снова, дельты не теряются и не задваиваются."""
+
+    def __init__(self, nodes: list[Node], db_path: str = "cluster.db"):
+        self.nodes = nodes
+        self._db = _sqlite3.connect(db_path, check_same_thread=False)
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS cursors (
+                node  TEXT PRIMARY KEY,   -- api ноды
+                since INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS keys (
+                external_id TEXT NOT NULL,
+                node        TEXT NOT NULL,
+                key_id      TEXT NOT NULL,
+                bytes_limit INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (external_id, node)
+            );
+        """)
+        self._db.commit()
+
+    def close(self) -> None:
+        self._db.close()
+
+    # -- внутреннее ------------------------------------------------------------------
+
+    def _cursor(self, api: str) -> int:
+        row = self._db.execute("SELECT since FROM cursors WHERE node = ?", (api,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def _set_cursor(self, api: str, since: int) -> None:
+        self._db.execute(
+            "INSERT INTO cursors (node, since) VALUES (?, ?) "
+            "ON CONFLICT(node) DO UPDATE SET since = excluded.since", (api, since))
+        self._db.commit()
+
+    # -- операции --------------------------------------------------------------------
+
+    async def create_everywhere(self, external_id: str, *, bytes_limit: int = 0,
+                                local_limit: int = 0, expires_days: int = 0) -> dict:
+        """Один external_id на все ноды. {api: {"key": id}} для удачных,
+        {api: {"error": msg}} для неудач (частичный успех допустим)."""
+        out: dict = {}
+        for node in self.nodes:
+            try:
+                resp = await node.create_key(
+                    external_id=external_id, bytes_limit=bytes_limit,
+                    local_limit=local_limit, expires_days=expires_days)
+                key_id = resp["key"]
+                out[node.api] = {"key": key_id}
+                self._db.execute(
+                    "INSERT INTO keys (external_id, node, key_id, bytes_limit) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(external_id, node) DO UPDATE SET key_id = excluded.key_id, "
+                    "bytes_limit = excluded.bytes_limit",
+                    (external_id, node.api, key_id, bytes_limit))
+                self._db.commit()
+            except Exception as e:
+                out[node.api] = {"error": str(e)}
+        return out
+
+    async def usage_all(self) -> dict[str, int]:
+        """Забирает дельты со всех нод по их курсорам; возвращает СУММУ прироста байт
+        по каждому external_id. Курсор двигается только при полном успехе забора ноды."""
+        totals: dict[str, int] = {}
+        for node in self.nodes:
+            since = self._cursor(node.api)
+            try:
+                while True:
+                    page = await node.usage(since=since, limit=1000)
+                    for item in page.get("items", []):
+                        ext = item.get("external_id") or item.get("key_id")
+                        totals[ext] = totals.get(ext, 0) + int(item.get("bytes", 0))
+                    nxt = int(page.get("next", since))
+                    if not page.get("items") or nxt <= since:
+                        since = nxt
+                        break
+                    since = nxt
+                self._set_cursor(node.api, since)
+            except Exception as e:
+                _log.warning("usage_all: нода %s: %s", node.api, e)
+        return totals
+
+    async def revoke_everywhere(self, external_id: str) -> dict:
+        """Отозвать ключ external_id на всех нодах, где он есть. {api: {"ok": true}|{"error": msg}}."""
+        rows = self._db.execute(
+            "SELECT node, key_id FROM keys WHERE external_id = ?", (external_id,)).fetchall()
+        out: dict = {}
+        for api, key_id in rows:
+            node = next((n for n in self.nodes if n.api == api), None)
+            if node is None:
+                out[api] = {"error": "нода не подключена к кластеру"}
+                continue
+            try:
+                await node.revoke(key_id)
+                out[api] = {"ok": True}
+            except Exception as e:
+                out[api] = {"error": str(e)}
+        return out
+
+    def bundle(self, external_id: str, name: str) -> str:
+        """Собирает bundle-ссылку из созданных ключей. KeyError, если ключей нет нигде."""
+        rows = self._db.execute(
+            "SELECT node, key_id FROM keys WHERE external_id = ?", (external_id,)).fetchall()
+        by_api = {r[0]: r[1] for r in rows}
+        pairs = [(n, by_api[n.api]) for n in self.nodes if n.api in by_api]
+        if not pairs:
+            raise KeyError(f"нет созданных ключей для {external_id!r}")
+        return make_bundle(name, pairs)
