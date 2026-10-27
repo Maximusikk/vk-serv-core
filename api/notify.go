@@ -31,10 +31,11 @@ const (
 )
 
 type notifyPayload struct {
-	Type    string `json:"type"` // vk_link_dead | disk_low | ports_low
+	Type    string `json:"type"` // vk_link_dead | disk_low | ports_low | port_down | port_recovered
 	Message string `json:"message"`
 	TS      int64  `json:"ts"`
 	Version string `json:"api_version"`
+	Port    int    `json:"port,omitempty"` // port_down / port_recovered (1.4)
 }
 
 // runNotifyChecker — фоновый цикл уведомлений; молчит, если NotifyURL не задан.
@@ -128,4 +129,24 @@ func (s *Server) postNotify(client *http.Client, a notifyPayload) bool {
 	}
 	log.Printf("[notify] отправлено: %s", a.Type)
 	return true
+}
+
+// sendPortDownWebhook отправляет событие port_down / port_recovered немедленно (1.4).
+// Вызывается reconcile-циклом при ПЕРЕХОДЕ порта в down и обратно — не по расписанию,
+// поэтому отдельный троттлинг не нужен. Молчит, если NotifyURL не задан.
+// Назначается полю Server.notifyPortDown в NewServer (в тестах подменяется).
+func (s *Server) sendPortDownWebhook(port int, recovered bool, reason string) {
+	if s.cfg.NotifyURL == "" {
+		return
+	}
+	a := notifyPayload{Port: port, Message: reason}
+	if recovered {
+		a.Type = "port_recovered"
+	} else {
+		a.Type = "port_down"
+	}
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		s.postNotify(client, a)
+	}()
 }

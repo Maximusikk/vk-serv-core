@@ -40,6 +40,8 @@ type Config struct {
 
 	NotifyURL string // webhook продавца для уведомлений (G5); пусто = выключено
 
+	ReconcileInterval time.Duration // период reconcile-цикла портов (1.3); 0 = дефолт 20 с
+
 	TLSDir string // каталог api.crt/api.key (S1); по умолчанию /opt/vkturn/tls
 	TLSPin string // SPKI-пин сертификата API: hex SHA-256, 64 символа (не секрет)
 }
@@ -72,6 +74,9 @@ func main() {
 	flag.IntVar(&cfg.MaxActive, "max-active", maxActive, "максимум живых портов vkserv (0 = без ограничения)")
 	flag.StringVar(&cfg.AdminAllow, "admin-allow", os.Getenv("ADMIN_ALLOW"), "IP/CIDR через запятую, с которых разрешён /admin/* (пусто = с любого IP)")
 	flag.StringVar(&cfg.NotifyURL, "notify-url", os.Getenv("NOTIFY_URL"), "webhook для уведомлений продавцу: VK-ссылка умерла, диск/порты на исходе (пусто = выключено)")
+	// 1.3: период reconcile-цикла; env RECONCILE_INTERVAL (секунды) как альтернатива флагу
+	reconcileSec := envInt("RECONCILE_INTERVAL")
+	flag.DurationVar(&cfg.ReconcileInterval, "reconcile-interval", time.Duration(reconcileSec)*time.Second, "период reconcile-цикла портов (напр. 20s; 0 = дефолт 20s)")
 	tlsDir := os.Getenv("TLS_DIR")
 	if tlsDir == "" {
 		tlsDir = defaultTLSDir
@@ -120,6 +125,7 @@ func main() {
 	go srv.runTrafficPoller(context.Background())
 	go srv.runExpiryTicker(context.Background())
 	go srv.runNotifyChecker(context.Background())
+	go srv.runReconciler(context.Background()) // 1.3: сверка портов с реальностью
 
 	mux := http.NewServeMux()
 	registerRoutes(mux, srv)
