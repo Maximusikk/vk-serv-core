@@ -262,6 +262,8 @@ masquerade:
     rewriteHost: true
 EOF
 chmod 600 "$INSTALL_DIR/hy2.yaml"   # 0.12: внутри пароль hysteria2
+# 0.12: api.db может существовать при переустановке — новый файл создаст сам API под UMask=0077
+[ -f "$INSTALL_DIR/api.db" ] && chmod 600 "$INSTALL_DIR/api.db"
 
 # ── Systemd сервисы ───────────────────────────────────────────────────────────
 step "Настройка systemd"
