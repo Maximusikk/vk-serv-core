@@ -215,6 +215,18 @@ EOF
     else
         warn "Нет $INSTALL_DIR/api.env — PUBLIC_URL не задан, ссылки в ответе create будут с 127.0.0.1"
     fi
+    # 2.4: MASTER_TOKEN для серверов, поставленных до мультисервера — иначе их нельзя
+    # подключить к боту/мастеру без переустановки. Существующий не трогаем.
+    if [ -f "$INSTALL_DIR/api.env" ] && ! grep -q '^MASTER_TOKEN=' "$INSTALL_DIR/api.env"; then
+        NEW_MASTER_TOKEN=$(openssl rand -hex 24)
+        echo "MASTER_TOKEN=$NEW_MASTER_TOKEN" >> "$INSTALL_DIR/api.env"
+        chmod 600 "$INSTALL_DIR/api.env"
+        if [ -f "$INSTALL_DIR/config.txt" ] && ! grep -q '^MASTER_TOKEN=' "$INSTALL_DIR/config.txt"; then
+            echo "MASTER_TOKEN=$NEW_MASTER_TOKEN" >> "$INSTALL_DIR/config.txt"
+        fi
+        info "MASTER_TOKEN сгенерирован и добавлен в api.env"
+        printf 'VKTURN_MASTER_TOKEN=%s\n' "$NEW_MASTER_TOKEN"
+    fi
     if ufw status 2>/dev/null | grep "Status: active" >/dev/null; then
         ufw allow $API_PORT/tcp comment "VKTurn API" >/dev/null 2>&1 || true
     elif ! iptables -C INPUT -p tcp --dport $API_PORT -j ACCEPT 2>/dev/null; then

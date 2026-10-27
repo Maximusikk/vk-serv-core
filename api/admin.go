@@ -52,6 +52,7 @@ func (s *Server) tokenAuthorized(token, path string) bool {
 
 // masterTokenAllowed — роуты, доступные с master-token (2.4).
 func masterTokenAllowed(path string) bool {
+	path = strings.TrimPrefix(path, "/v1") // алиасы /v1/admin/... (C7)
 	return path == "/admin/health" || path == "/admin/usage" || strings.HasPrefix(path, "/admin/keys")
 }
 
