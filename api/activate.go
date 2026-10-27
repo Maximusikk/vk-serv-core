@@ -188,6 +188,11 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:  expiresAt,
 		BytesLimit: bytesLimit,
 	})
+
+	// 2.5: ключ успешно активирован, порт выдан — уведомляем продавца.
+	var extID string
+	_ = s.db.QueryRow(`SELECT IFNULL(external_id,'') FROM keys WHERE id = ?`, req.Key).Scan(&extID)
+	s.notifyKeyEvent("key_activated", req.Key, extID, prov.Port)
 }
 
 // ── Выдача порта ──────────────────────────────────────────────────────────────

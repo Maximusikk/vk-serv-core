@@ -24,6 +24,10 @@ type Server struct {
 	// 1.4: вебхук перехода порта в down/восстановление; NewServer ставит реальную
 	// реализацию (sendPortDownWebhook), тесты подменяют.
 	notifyPortDown func(port int, recovered bool, reason string)
+
+	// 2.5: вебхук события ключа (key_activated/key_limit_80/key_limit/key_expired/
+	// key_revoked); NewServer ставит реализацию из notify.go, тесты подменяют.
+	notifyKeyEventFn func(event, keyID, externalID string, port int)
 }
 
 // NewServer создаёт Server поверх открытой БД.
@@ -35,5 +39,7 @@ func NewServer(db *sql.DB, cfg *Config) *Server {
 		adminAuthLimiter: newIPLimiter(adminRateLimit, adminRateWin),
 	}
 	s.notifyPortDown = s.sendPortDownWebhook
+	// 2.5: реальная реализация вебхуков событий ключа
+	s.notifyKeyEventFn = s.sendKeyEventWebhook
 	return s
 }

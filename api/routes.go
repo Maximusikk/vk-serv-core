@@ -25,6 +25,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	// Админские (за проверкой X-Admin-Token)
 	reg("/admin/keys/create", s.adminMiddleware(s.handleAdminCreateKey))
 	reg("/admin/keys", s.adminMiddleware(s.handleAdminListKeys))
+	reg("/admin/usage", s.adminMiddleware(s.handleAdminUsage)) // 2.2: дельты трафика по курсору
 	reg("/admin/vk", s.adminMiddleware(s.handleAdminPutVK))
 	reg("/admin/vk/links", s.adminMiddleware(s.handleAdminVKLinks))
 	reg("/admin/health", s.adminMiddleware(s.handleAdminHealth))

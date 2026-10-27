@@ -15,6 +15,8 @@ import (
 // Порядок: allowlist → блокировка IP (до сверки токена) → сверка токена → учёт неудачи.
 // ≥ adminRateLimit неудач за окно с одного IP → 429 даже при верном токене;
 // успешные запросы лимит не тратят.
+// 2.4: master-token принимается только на узком наборе роутов (masterTokenAllowed);
+// неудачный master-token считается тем же лимитером, что и неудачный admin-token.
 func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// D2: опциональный allowlist по IP — до проверки токена (пустой список = разрешено всем)
@@ -29,13 +31,28 @@ func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		token := r.Header.Get("X-Admin-Token")
-		if !secretEqual(token, s.cfg.AdminToken) {
+		if !s.tokenAuthorized(token, r.URL.Path) {
 			s.adminAuthLimiter.record(ip)
 			jsonError(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// tokenAuthorized — единая constant-time сверка токена для adminMiddleware:
+// admin-token действует на все /admin/* роуты, master-token (2.4) — только
+// на /admin/keys*, /admin/usage и /admin/health.
+func (s *Server) tokenAuthorized(token, path string) bool {
+	if secretEqual(token, s.cfg.AdminToken) {
+		return true
+	}
+	return s.cfg.MasterToken != "" && masterTokenAllowed(path) && secretEqual(token, s.cfg.MasterToken)
+}
+
+// masterTokenAllowed — роуты, доступные с master-token (2.4).
+func masterTokenAllowed(path string) bool {
+	return path == "/admin/health" || path == "/admin/usage" || strings.HasPrefix(path, "/admin/keys")
 }
 
 // secretEqual — constant-time сравнение секрета (пустые значения никогда не равны).
@@ -79,6 +96,7 @@ func validateKeyLimits(expiresDays *int64, bytesLimit *int64, notes *string, str
 type createKeyRequest struct {
 	ExpiresDays int64  `json:"expires_days"` // срок в днях (0 = бессрочно — устаревший вариант, см. unlimited)
 	BytesLimit  int64  `json:"bytes_limit"`  // 0 = безлимит (байты)
+	LocalLimit  int64  `json:"local_limit"`  // 2.3: локальный стоп на ноде; 0 = нет
 	Notes       string `json:"notes"`        // имя юзера / комментарий
 	Unlimited   bool   `json:"unlimited"`    // явный бессрочный ключ
 	ExternalID  string `json:"external_id"`  // идемпотентность: номер заказа/платежа бота
@@ -154,6 +172,11 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.LocalLimit < 0 {
+		jsonError(w, "local_limit must be >= 0", http.StatusBadRequest)
+		return
+	}
+
 	key, err := GenerateKey()
 	if err != nil {
 		jsonError(w, "crypto error", http.StatusInternalServerError)
@@ -177,9 +200,9 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = s.db.Exec(`
-		INSERT INTO keys (id, created_at, expires_at, bytes_limit, notes, external_id, duration_days)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		key, now, expiresAt, req.BytesLimit, req.Notes, nullIfEmpty(req.ExternalID), durationDays)
+		INSERT INTO keys (id, created_at, expires_at, bytes_limit, local_limit, notes, external_id, duration_days)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		key, now, expiresAt, req.BytesLimit, req.LocalLimit, req.Notes, nullIfEmpty(req.ExternalID), durationDays)
 	if err != nil {
 		// Гонка двух одинаковых external_id: уникальный индекс отдаёт существующий ключ
 		if strings.Contains(err.Error(), "UNIQUE") && req.ExternalID != "" {
@@ -232,6 +255,7 @@ type keyInfo struct {
 	ExpiresAt   int64  `json:"expires_at"`
 	BytesUsed   int64  `json:"bytes_used"`
 	BytesLimit  int64  `json:"bytes_limit"`
+	LocalLimit  int64  `json:"local_limit"` // 2.3: локальный стоп на ноде (0 = нет)
 	Port        *int   `json:"port"`
 	Notes       string `json:"notes"`
 	Active      bool   `json:"active"`
@@ -305,7 +329,7 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 	statusFilter := q.Get("status")
 	query := `
 		SELECT id, created_at, activated_at, expires_at,
-		       bytes_used, bytes_limit, port, COALESCE(notes, ''), COALESCE(device_id, '') != '', revoked_at,
+		       bytes_used, bytes_limit, COALESCE(local_limit, 0), port, COALESCE(notes, ''), COALESCE(device_id, '') != '', revoked_at,
 		       COALESCE(duration_days, 0)
 		FROM keys WHERE ` + strings.Join(where, " AND ") + ` ORDER BY created_at DESC`
 	// Статус вычисляется в Go, поэтому при фильтре по статусу limit/offset применяем ПОСЛЕ
@@ -329,7 +353,7 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var k keyInfo
 		if err := rows.Scan(&k.ID, &k.CreatedAt, &k.ActivatedAt, &k.ExpiresAt,
-			&k.BytesUsed, &k.BytesLimit, &k.Port, &k.Notes, &k.DeviceBound, &k.RevokedAt, &k.DurationDays); err != nil {
+			&k.BytesUsed, &k.BytesLimit, &k.LocalLimit, &k.Port, &k.Notes, &k.DeviceBound, &k.RevokedAt, &k.DurationDays); err != nil {
 			continue
 		}
 		k.Active = true
@@ -386,12 +410,12 @@ func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 
 	row := s.db.QueryRow(`
 		SELECT id, created_at, activated_at, expires_at,
-		       bytes_used, bytes_limit, port, COALESCE(notes, ''), COALESCE(device_id, '') != '', revoked_at,
+		       bytes_used, bytes_limit, COALESCE(local_limit, 0), port, COALESCE(notes, ''), COALESCE(device_id, '') != '', revoked_at,
 		       COALESCE(duration_days, 0)
 		FROM keys WHERE id = ?`, id)
 	var k keyInfo
 	if err := row.Scan(&k.ID, &k.CreatedAt, &k.ActivatedAt, &k.ExpiresAt,
-		&k.BytesUsed, &k.BytesLimit, &k.Port, &k.Notes, &k.DeviceBound, &k.RevokedAt, &k.DurationDays); err != nil {
+		&k.BytesUsed, &k.BytesLimit, &k.LocalLimit, &k.Port, &k.Notes, &k.DeviceBound, &k.RevokedAt, &k.DurationDays); err != nil {
 		jsonError(w, "key not found", http.StatusNotFound)
 		return
 	}
@@ -429,7 +453,8 @@ func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var port *int
-	if err := s.db.QueryRow(`SELECT port FROM keys WHERE id = ?`, id).Scan(&port); err != nil {
+	var externalID string
+	if err := s.db.QueryRow(`SELECT port, IFNULL(external_id,'') FROM keys WHERE id = ?`, id).Scan(&port, &externalID); err != nil {
 		jsonError(w, "key not found", http.StatusNotFound)
 		return
 	}
@@ -447,6 +472,9 @@ func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(`SELECT revoked_at FROM keys WHERE id = ?`, id).Scan(&revokedAt)
 
 	jsonOK(w, map[string]any{"status": "revoked", "key": id, "revoked_at": revokedAt})
+
+	// 2.5: ключ отозван — уведомляем продавца.
+	s.notifyKeyEvent("key_revoked", id, externalID, 0)
 }
 
 // ── DELETE /admin/keys/{id} — purge ───────────────────────────────────────────
@@ -463,10 +491,11 @@ func (s *Server) handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Получаем порт перед удалением
-	row := s.db.QueryRow(`SELECT port FROM keys WHERE id = ?`, id)
+	// Получаем порт и external_id перед удалением
+	row := s.db.QueryRow(`SELECT port, IFNULL(external_id,'') FROM keys WHERE id = ?`, id)
 	var port *int
-	_ = row.Scan(&port)
+	var externalID string
+	_ = row.Scan(&port, &externalID)
 
 	// Деактивируем сервис если был запущен
 	if port != nil {
@@ -486,6 +515,9 @@ func (s *Server) handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, map[string]string{"status": "deleted", "key": id})
+
+	// 2.5: purge тоже считается отзывом ключа.
+	s.notifyKeyEvent("key_revoked", id, externalID, 0)
 }
 
 // ── PATCH /admin/keys/{id} ────────────────────────────────────────────────────
@@ -493,6 +525,7 @@ func (s *Server) handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 type patchKeyRequest struct {
 	ExpiresDays *int64  `json:"expires_days"` // nil = не менять; 0 = бессрочно
 	BytesLimit  *int64  `json:"bytes_limit"`  // nil = не менять
+	LocalLimit  *int64  `json:"local_limit"`  // nil = не менять; 0 = убрать потолок (2.3)
 	Notes       *string `json:"notes"`        // nil = не менять
 }
 
@@ -518,16 +551,21 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Получаем текущее состояние
-	row := s.db.QueryRow(`SELECT expires_at, bytes_limit, notes, activated_at, COALESCE(duration_days, 0)
+	row := s.db.QueryRow(`SELECT expires_at, bytes_limit, COALESCE(local_limit, 0), notes, activated_at, COALESCE(duration_days, 0)
 		FROM keys WHERE id = ?`, id)
-	var expiresAt, bytesLimit, durationDays int64
+	var expiresAt, bytesLimit, localLimit, durationDays int64
 	var notes string
 	var activatedAt *int64
-	if err := row.Scan(&expiresAt, &bytesLimit, &notes, &activatedAt, &durationDays); err != nil {
+	if err := row.Scan(&expiresAt, &bytesLimit, &localLimit, &notes, &activatedAt, &durationDays); err != nil {
 		jsonError(w, "key not found", http.StatusNotFound)
 		return
 	}
 	prevLimit := bytesLimit
+
+	if req.LocalLimit != nil && *req.LocalLimit < 0 {
+		jsonError(w, "local_limit must be >= 0", http.StatusBadRequest)
+		return
+	}
 
 	// C5: ключ ещё не активирован и срок пойдёт с активации — продление меняет duration_days,
 	// expires_at остаётся 0 (отсчёт не запускается).
@@ -558,14 +596,17 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 	if req.BytesLimit != nil {
 		bytesLimit = *req.BytesLimit
 	}
+	if req.LocalLimit != nil {
+		localLimit = *req.LocalLimit
+	}
 	if req.Notes != nil {
 		notes = *req.Notes
 	}
 
 	_, err := s.db.Exec(`
-		UPDATE keys SET expires_at = ?, bytes_limit = ?, notes = ?, duration_days = NULLIF(?, 0)
+		UPDATE keys SET expires_at = ?, bytes_limit = ?, local_limit = ?, notes = ?, duration_days = NULLIF(?, 0)
 		WHERE id = ?`,
-		expiresAt, bytesLimit, notes, durationDays, id)
+		expiresAt, bytesLimit, localLimit, notes, durationDays, id)
 	if err != nil {
 		jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -586,6 +627,7 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 		"expires_at":    expiresAt,
 		"duration_days": durationDays,
 		"bytes_limit":   bytesLimit,
+		"local_limit":   localLimit,
 		"notes":         notes,
 	}
 	if reprovisioned {

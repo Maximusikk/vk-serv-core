@@ -9,13 +9,22 @@ package main
 //   disk_low      — свободное место на разделе установки < 500 МБ
 //   ports_low     — занято ≥ 90% ёмкости портов (max_active или диапазон портов)
 //
+// 2.5: события ключа (key_activated, key_limit_80, key_limit, key_expired,
+// key_revoked) отправляются немедленно при наступлении (sendKeyEventWebhook),
+// с key_id и external_id; при заданном NOTIFY_SECRET — с заголовком
+// X-VKTurn-Signature: hex HMAC-SHA256(тело, секрет).
+//
 // Чтобы не заспамить продавца: одно и то же событие отправляется не чаще,
 // чем раз в notifyRepeatAfter (6 ч), пока остаётся активным.
 
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"syscall"
@@ -148,5 +157,86 @@ func (s *Server) sendPortDownWebhook(port int, recovered bool, reason string) {
 	go func() {
 		client := &http.Client{Timeout: 10 * time.Second}
 		s.postNotify(client, a)
+	}()
+}
+
+// keyEventPayload — тело вебхука события ключа (2.5). ExternalID как any:
+// пустой external_id сериализуется в null, непустой — в строку.
+type keyEventPayload struct {
+	Type       string `json:"type"`
+	KeyID      string `json:"key_id"`
+	ExternalID any    `json:"external_id"` // string или null
+	Port       int    `json:"port,omitempty"`
+	Message    string `json:"message"`
+	TS         int64  `json:"ts"`
+	Version    string `json:"api_version"`
+}
+
+// keyEventMessage — короткий человеческий текст события на русском.
+func keyEventMessage(event string, port int) string {
+	switch event {
+	case "key_activated":
+		return fmt.Sprintf("Ключ активирован, порт %d", port)
+	case "key_limit_80":
+		return "Ключ израсходовал 80% лимита трафика"
+	case "key_limit":
+		return "Ключ отключён: лимит трафика исчерпан"
+	case "key_expired":
+		return "Ключ отключён: срок действия истёк"
+	case "key_revoked":
+		return "Ключ отозван продавцом"
+	}
+	return event
+}
+
+// sendKeyEventWebhook отправляет событие ключа (2.5) немедленно в горутине —
+// основные пути (активация, учёт трафика, revoke) не блокируются. Молчит,
+// если NotifyURL не задан. Тело маршалируется один раз: HMAC-подпись считается
+// по точному байтовому представлению отправленного тела. При заданном
+// NotifySecret добавляется заголовок X-VKTurn-Signature: hex HMAC-SHA256(body, secret).
+func (s *Server) sendKeyEventWebhook(event, keyID, externalID string, port int) {
+	if s.cfg.NotifyURL == "" {
+		return
+	}
+	p := keyEventPayload{
+		Type:    event,
+		KeyID:   keyID,
+		Port:    port,
+		Message: keyEventMessage(event, port),
+		TS:      time.Now().Unix(),
+		Version: APIVersion,
+	}
+	if externalID != "" {
+		p.ExternalID = externalID
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		log.Printf("[notify] %s: marshal: %v", event, err)
+		return
+	}
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		req, err := http.NewRequest("POST", s.cfg.NotifyURL, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[notify] %s: %v", event, err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if s.cfg.NotifySecret != "" {
+			mac := hmac.New(sha256.New, []byte(s.cfg.NotifySecret))
+			mac.Write(body)
+			req.Header.Set("X-VKTurn-Signature", hex.EncodeToString(mac.Sum(nil)))
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[notify] %s: %v", event, err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			log.Printf("[notify] %s: HTTP %d", event, resp.StatusCode)
+			return
+		}
+		log.Printf("[notify] отправлено: %s", event)
 	}()
 }

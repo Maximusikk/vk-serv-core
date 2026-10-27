@@ -11,6 +11,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -28,12 +30,22 @@ func (s *Server) statsPath(port int) string {
 	return filepath.Join(s.cfg.InstallDir, "users", strconv.Itoa(port)+".stats")
 }
 
-// runTrafficPoller — фоновый цикл учёта трафика.
+// runTrafficPoller — фоновый цикл учёта трафика. Попутно, раз в час, чистит
+// usage_log от записей старше 7 дней (2.2).
 func (s *Server) runTrafficPoller(ctx context.Context) {
 	t := time.NewTicker(trafficPollInterval)
 	defer t.Stop()
+	var lastClean time.Time
 	for {
 		s.pollTraffic()
+		if lastClean.IsZero() || time.Since(lastClean) >= time.Hour {
+			if n, err := s.cleanUsageLog(7 * 24 * time.Hour); err != nil {
+				log.Printf("[usage] clean: %v", err)
+			} else if n > 0 {
+				log.Printf("[usage] чистка usage_log: удалено %d записей старше 7 дней", n)
+			}
+			lastClean = time.Now()
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -57,10 +69,10 @@ func (s *Server) runExpiryTicker(ctx context.Context) {
 }
 
 // expireOutdatedKeys гасит порты ключей, у которых истёк expires_at
-// (так же, как это делает addTraffic при исчерпании лимита).
+// (так же, как это делает addTraffic при исчерпании лимита), и шлёт key_expired (2.5).
 func (s *Server) expireOutdatedKeys() {
 	rows, err := s.db.Query(`
-		SELECT id, port FROM keys
+		SELECT id, port, IFNULL(external_id,'') FROM keys
 		WHERE port IS NOT NULL AND activated_at IS NOT NULL
 		  AND expires_at > 0 AND expires_at < ?`, time.Now().Unix())
 	if err != nil {
@@ -68,19 +80,20 @@ func (s *Server) expireOutdatedKeys() {
 		return
 	}
 	type expired struct {
-		id   string
-		port int
+		id, externalID string
+		port           int
 	}
 	var out []expired
 	for rows.Next() {
 		var e expired
-		if rows.Scan(&e.id, &e.port) == nil {
+		if rows.Scan(&e.id, &e.port, &e.externalID) == nil {
 			out = append(out, e)
 		}
 	}
 	rows.Close()
 	for _, e := range out {
 		s.deactivatePort(e.port, "expired (key "+e.id+")")
+		s.notifyKeyEvent("key_expired", e.id, e.externalID, e.port)
 	}
 }
 
@@ -140,21 +153,104 @@ func (s *Server) pollTraffic() {
 	}
 }
 
-// addTraffic добавляет байты к ключу на порту и отключает порт при превышении лимита.
+// addTraffic добавляет байты к ключу на порту, пишет дельту в usage_log (2.2)
+// и отключает порт при исчерпании лимита — общего (bytes_limit) или локального
+// стоп-крана (local_limit, 2.3).
 func (s *Server) addTraffic(port int, n int64) {
-	res, err := s.db.Exec(`UPDATE keys SET bytes_used = bytes_used + ?
-		WHERE port = ? AND activated_at IS NOT NULL`, n, port)
+	// Одна транзакция: прирост + чтение нового состояния + запись дельты в журнал.
+	var keyID, externalID string
+	var used, limit, localLimit int64
+	err := s.tx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE keys SET bytes_used = bytes_used + ?
+			WHERE port = ? AND activated_at IS NOT NULL`, n, port)
+		if err != nil {
+			return err
+		}
+		if affected, _ := res.RowsAffected(); affected == 0 {
+			return errNoKeyOnPort // порт уже никому не принадлежит — нечего учитывать
+		}
+		if err := tx.QueryRow(`SELECT id, IFNULL(external_id,''), bytes_used, bytes_limit, local_limit
+			FROM keys WHERE port = ?`, port).
+			Scan(&keyID, &externalID, &used, &limit, &localLimit); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`INSERT INTO usage_log (key_id, bytes, ts) VALUES (?, ?, ?)`,
+			keyID, n, time.Now().Unix())
+		return err
+	})
 	if err != nil {
-		log.Printf("[traffic] port %d: %v", port, err)
+		if err != errNoKeyOnPort {
+			log.Printf("[traffic] port %d: %v", port, err)
+		}
 		return
 	}
-	if affected, _ := res.RowsAffected(); affected == 0 {
-		return
+
+	// 2.5: key_limit_80 — один раз на ключ (флаг limit80_notified).
+	if limit > 0 && used*100 >= limit*80 {
+		res, err := s.db.Exec(`UPDATE keys SET limit80_notified = 1
+			WHERE id = ? AND limit80_notified = 0 AND bytes_limit > 0
+			  AND bytes_used*100 >= bytes_limit*80`, keyID)
+		if err == nil {
+			if affected, _ := res.RowsAffected(); affected > 0 {
+				s.notifyKeyEvent("key_limit_80", keyID, externalID, port)
+			}
+		}
 	}
-	var used, limit int64
-	if err := s.db.QueryRow(`SELECT bytes_used, bytes_limit FROM keys WHERE port = ?`, port).
-		Scan(&used, &limit); err == nil && limit > 0 && used >= limit {
-		s.deactivatePort(port, "bytes limit exceeded")
+
+	if (limit > 0 && used >= limit) || (localLimit > 0 && used >= localLimit) {
+		reason := "bytes limit exceeded"
+		if limit <= 0 {
+			reason = "local limit exceeded"
+		}
+		// Гашение под provisionMu с повторной проверкой ключа (урок из карты).
+		s.deactivatePortForLimit(port, keyID, externalID, reason)
+	}
+}
+
+// errNoKeyOnPort — в addTraffic порт уже не привязан к активированному ключу.
+var errNoKeyOnPort = errors.New("no active key on port")
+
+// deactivatePortForLimit гасит порт по лимиту: берёт provisionMu, заново
+// проверяет под блокировкой, что на порту всё тот же действующий ключ и лимит
+// всё ещё исчерпан (мастер мог успеть снять лимит или сменить владельца), и
+// только тогда гасит. Событие key_limit шлётся только при реальном гашении.
+func (s *Server) deactivatePortForLimit(port int, keyID, externalID, reason string) {
+	s.provisionMu.Lock()
+	defer s.provisionMu.Unlock()
+
+	var cur string
+	var used, limit, localLimit int64
+	if err := s.db.QueryRow(`SELECT id, bytes_used, bytes_limit, local_limit FROM keys
+		WHERE port = ? AND activated_at IS NOT NULL AND revoked_at IS NULL`, port).
+		Scan(&cur, &used, &limit, &localLimit); err != nil || cur != keyID {
+		return // ключ сменился/отозван/не найден — гасить чужой порт нельзя
+	}
+	if (limit <= 0 || used < limit) && (localLimit <= 0 || used < localLimit) {
+		return // лимит уже снят (add_traffic) — порт живой
+	}
+	s.deactivatePortLocked(port, reason)
+	s.notifyKeyEvent("key_limit", keyID, externalID, port)
+}
+
+// tx выполняет fn в транзакции: ошибка fn → rollback, иначе commit.
+func (s *Server) tx(fn func(tx *sql.Tx) error) error {
+	t, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := fn(t); err != nil {
+		_ = t.Rollback()
+		return err
+	}
+	return t.Commit()
+}
+
+// notifyKeyEvent — точка вызова вебхуков событий ключа (2.5). Реальная
+// реализация назначается в NewServer (notifyKeyEventFn, см. notify.go);
+// nil (в старых тестах) — молча пропускаем.
+func (s *Server) notifyKeyEvent(event, keyID, externalID string, port int) {
+	if s.notifyKeyEventFn != nil {
+		s.notifyKeyEventFn(event, keyID, externalID, port)
 	}
 }
 

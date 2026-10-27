@@ -128,6 +128,7 @@ SERVER_NAME="VKTurn-$(hostname | cut -c1-8)"
 
 # Токены API — генерируем всегда
 ADMIN_TOKEN=$(openssl rand -hex 24)
+MASTER_TOKEN=$(openssl rand -hex 24)
 INTERNAL_SECRET=$(openssl rand -hex 24)
 PORT_START=56001
 PORT_END=57000
@@ -333,6 +334,7 @@ if [ "$API_INSTALLED" = "1" ]; then
     umask 077
     cat > $INSTALL_DIR/api.env << EOF
 ADMIN_TOKEN=$ADMIN_TOKEN
+MASTER_TOKEN=$MASTER_TOKEN
 INTERNAL_SECRET=$INTERNAL_SECRET
 PUBLIC_URL=$SERVER_IP:$API_PORT
 ${NOTIFY_URL:+NOTIFY_URL=$NOTIFY_URL}
@@ -482,6 +484,7 @@ WRAP_PASS=$WRAP_PASS
 HY2_PASS=$HY2_PASS
 VK_LINK=$VK_LINK
 ADMIN_TOKEN=$ADMIN_TOKEN
+MASTER_TOKEN=$MASTER_TOKEN
 INTERNAL_SECRET=$INTERNAL_SECRET
 PORT_START=$PORT_START
 PORT_END=$PORT_END
@@ -508,10 +511,12 @@ fi
 
 # Вывод без ANSI — для парсинга приложением
 printf 'VKTURN_ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
+printf 'VKTURN_MASTER_TOKEN=%s\n' "$MASTER_TOKEN"
 if [ -n "$TLS_PIN" ]; then printf 'VKTURN_ADMIN_PIN=%s\n' "$TLS_PIN"; fi
 
 if [ "$API_INSTALLED" = "1" ]; then
     echo -e "${W}Admin token:${N} $ADMIN_TOKEN"
+    echo -e "${W}Master token:${N} $MASTER_TOKEN"
     if [ -n "$TLS_PIN" ]; then
         # --pinnedpubkey принимает base64 того же SPKI-хэша, что в TLS_PIN (hex). Только openssl.
         PIN_B64=""

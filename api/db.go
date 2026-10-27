@@ -36,8 +36,10 @@ CREATE TABLE IF NOT EXISTS keys (
 	activated_at INTEGER,                   -- NULL если не активирован
 	expires_at   INTEGER NOT NULL,          -- unix timestamp
 	bytes_limit  INTEGER NOT NULL DEFAULT 0, -- 0 = безлимит
-	bytes_used   INTEGER NOT NULL DEFAULT 0,
-	port         INTEGER,
+		bytes_used   INTEGER NOT NULL DEFAULT 0,
+		local_limit  INTEGER NOT NULL DEFAULT 0, -- 2.3: локальный стоп на ноде (0 = нет), предохранитель при пропаже мастера
+		limit80_notified INTEGER NOT NULL DEFAULT 0, -- 2.5: key_limit_80 уже отправлен (один раз на ключ)
+		port         INTEGER,
 	user_token   TEXT,
 	wrap_pass    TEXT,
 	notes        TEXT
@@ -62,6 +64,16 @@ CREATE TABLE IF NOT EXISTS vk_links (
 	link       TEXT PRIMARY KEY,
 	created_at INTEGER NOT NULL
 );
+-- Журнал дельт трафика (2.2): каждая дельта, прибавленная к bytes_used.
+-- Мастер забирает агрегаты по курсору (GET /admin/usage), записи старше 7 дней чистятся.
+CREATE TABLE IF NOT EXISTS usage_log (
+	id     INTEGER PRIMARY KEY AUTOINCREMENT,
+	key_id TEXT    NOT NULL,
+	bytes  INTEGER NOT NULL,
+	ts     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_log_id ON usage_log(id);
+CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
 `
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -76,6 +88,8 @@ CREATE TABLE IF NOT EXISTS vk_links (
 		`ALTER TABLE keys ADD COLUMN vk_link TEXT`,           // VK-звонок, закреплённый за ключом (пул ссылок); NULL = основная
 		`ALTER TABLE ports ADD COLUMN state TEXT`,            // 1.2: active / down / error (NULL = ещё не проверялся)
 		`ALTER TABLE ports ADD COLUMN state_checked_at INTEGER`, // 1.2: unix ts последней проверки
+		`ALTER TABLE keys ADD COLUMN local_limit INTEGER NOT NULL DEFAULT 0`,      // 2.3: локальный стоп на ноде
+		`ALTER TABLE keys ADD COLUMN limit80_notified INTEGER NOT NULL DEFAULT 0`, // 2.5: key_limit_80 отправлен
 	} {
 		if _, err := d.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate %q: %w", stmt, err)
