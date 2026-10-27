@@ -63,7 +63,8 @@ func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
 func (l *wrapPacketListener) Close() error   { return l.inner.Close() }
 func (l *wrapPacketListener) Addr() net.Addr { return l.inner.Addr() }
 
-// wireStats — все байты на порту (с обфускацией), оба направления. Источник для учёта трафика (-stats-file).
+// wireStats — байты на порту (с обфускацией), оба направления, только пакеты,
+// прошедшие проверку AEAD. Источник для учёта трафика (-stats-file).
 // rx = от клиента к серверу, tx = от сервера к клиенту (загрузки пользователя).
 var wireStats throughputStats
 
@@ -80,11 +81,14 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, addr, err
 	}
-	wireStats.addRx(n)
 	plain, err := obfsUnwrapPacket(c.key, buf[:n], p)
 	if err != nil {
+		// Пакет не прошёл проверку AEAD (мусор/подделка) — квоту не сжигаем.
 		return 0, addr, fmt.Errorf("wrap: unwrap: %w", err)
 	}
+	// Учёт только после успешной проверки AEAD (Z-15): поддельные пакеты
+	// не должны расходовать лимит пользователя.
+	wireStats.addRx(n)
 	return plain, addr, nil
 }
 

@@ -273,8 +273,10 @@ func (s *Server) provisionPort(keyID string, keepToken bool) (*provisionResult, 
 			wrap_pass    = ?
 		WHERE id = ?`,
 		now, now, port, userToken, wrapPass, keyID); err != nil {
-		// Откат: останавливаем сервис, закрываем порт
+		// Откат: останавливаем сервис (и direct-exec процесс, если запускали),
+		// закрываем порт
 		_ = execTimeout(execTimeout10s, "systemctl", "stop", fmt.Sprintf("vkserv@%d", port))
+		s.stopDirectProcess(port)
 		_ = execTimeout(execTimeout10s, "iptables", "-D", "INPUT", "-p", "udp",
 			"--dport", strconv.Itoa(port), "-j", "ACCEPT")
 		_ = os.Remove(s.userConfPath(port))
@@ -316,6 +318,12 @@ func (s *Server) userConfPath(port int) string {
 	return filepath.Join(s.cfg.InstallDir, "users", strconv.Itoa(port)+".conf")
 }
 
+// userPidPath возвращает путь к pidfile direct-exec фолбэка (G3/Z-16).
+// При systemd-запуске файл не создаётся — юнит гасится systemctl.
+func (s *Server) userPidPath(port int) string {
+	return filepath.Join(s.cfg.InstallDir, "users", strconv.Itoa(port)+".pid")
+}
+
 // writeUserConf записывает /opt/vkturn/users/{port}.conf.
 func (s *Server) writeUserConf(port int, wrapPass, hy2Pass string) error {
 	dir := filepath.Join(s.cfg.InstallDir, "users")
@@ -345,7 +353,17 @@ func (s *Server) startUserService(port int) error {
 		cmd := exec.Command(filepath.Join(s.cfg.InstallDir, "server"), args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		return cmd.Start() // не Wait — фоновый процесс
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("direct exec failed: %w", err)
+		}
+		// G3/Z-16: процесс вне systemd — systemctl его не погасит. Пишем pidfile,
+		// по которому deactivatePort/откат provisionPort убьют процесс.
+		if werr := os.WriteFile(s.userPidPath(port), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0640); werr != nil {
+			_ = cmd.Process.Kill()
+			return fmt.Errorf("failed to write pidfile: %w", werr)
+		}
+		go func() { _ = cmd.Wait() }() // пожинаем процесс — не оставляем зомби
+		return nil
 	}
 	return nil
 }

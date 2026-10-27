@@ -402,8 +402,10 @@ func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // keyIDFromPath достаёт id из /admin/keys/<id>[/...] и приводит к нижнему регистру (C4).
+// Принимает и /v1-алиасы: /v1/admin/keys/<id>.
 func keyIDFromPath(path string) string {
-	id := strings.TrimPrefix(path, "/admin/keys/")
+	id := strings.TrimPrefix(path, "/v1")
+	id = strings.TrimPrefix(id, "/admin/keys/")
 	if i := strings.Index(id, "/"); i >= 0 {
 		id = id[:i]
 	}

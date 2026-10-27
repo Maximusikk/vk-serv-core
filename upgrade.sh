@@ -40,21 +40,22 @@ step "Загрузка $VKSERV_VERSION ($ARCH)"
 TMP=$(mktemp -d "$INSTALL_DIR/.upgrade.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
-# F5: проверка по SHA256SUMS из релиза. Если файла нет (старые релизы) — молча пропускаем;
-# релиз v1.0.3+ обязан его содержать.
+# F5: обязательная проверка по SHA256SUMS из релиза. Обхода нет: если SHA256SUMS
+# не скачался или в нём нет записи для ассета — это ошибка обновления (fail-closed).
 verify_sha256() { # FILE ASSET
-    local file="$1" asset="$2" sums want got
-    [ -n "${SKIP_SHA:-}" ] && return 0
-    if wget -q -O "$TMP/SHA256SUMS" "$VKSERV_REPO/SHA256SUMS" 2>/dev/null; then
-        want=$(awk -v f="$asset" '{sub(/^*/,"",$2)} $2==f{print $1}' "$TMP/SHA256SUMS")
-        if [ -n "$want" ]; then
-            got=$(sha256sum "$file" | awk '{print $1}')
-            if [ "$got" != "$want" ]; then
-                error "$asset: не совпал SHA-256 (ожидалось $want, получено $got) — файл релиза повреждён?"
-            fi
-            info "$asset: SHA-256 сверён"
-        fi
+    local file="$1" asset="$2" want got
+    if ! wget -q -O "$TMP/SHA256SUMS" "$VKSERV_REPO/SHA256SUMS" 2>/dev/null; then
+        error "$asset: не удалось скачать SHA256SUMS из релиза $VKSERV_VERSION — проверка целостности обязательна. Обновление прервано; если релиз опубликован без SHA256SUMS, сообщите об этом."
     fi
+    want=$(awk -v f="$asset" '{sub(/^*/,"",$2)} $2==f{print $1}' "$TMP/SHA256SUMS")
+    if [ -z "$want" ]; then
+        error "$asset: нет записи в SHA256SUMS релиза — проверка целостности обязательна"
+    fi
+    got=$(sha256sum "$file" | awk '{print $1}')
+    if [ "$got" != "$want" ]; then
+        error "$asset: не совпал SHA-256 (ожидалось $want, получено $got) — файл релиза повреждён?"
+    fi
+    info "$asset: SHA-256 сверён"
 }
 
 wget -q -O "$TMP/server" "$VKSERV_REPO/server-linux-$ARCH" || error "Не скачался server-linux-$ARCH"
@@ -123,6 +124,15 @@ fi
 rm -f "$INSTALL_DIR/tracker.sh"
 
 # ── API: слушать снаружи (для старых установок, где был только 127.0.0.1) ────
+# 0.12: права на секреты для существующих установок
+chmod 600 "$INSTALL_DIR/hy2.yaml" 2>/dev/null || true
+[ -f "$INSTALL_DIR/api.db" ] && chmod 600 "$INSTALL_DIR/api.db"
+if [ "$HAS_API" = "1" ]; then
+    if ! grep -q "^UMask=" "$API_UNIT"; then
+        sed -i "/^\[Service\]$/a UMask=0077" "$API_UNIT"
+        info "UMask=0077 добавлен в $API_UNIT (0.12)"
+    fi
+fi
 if [ "$HAS_API" = "1" ]; then
     if ! grep -- "-bind" "$API_UNIT" >/dev/null; then
         sed -i "s|-port $API_PORT|-bind 0.0.0.0 -port $API_PORT|" "$API_UNIT"
@@ -142,7 +152,24 @@ INTERNAL_SECRET=$INTERNAL_SECRET_T
 EOF
             chmod 600 "$INSTALL_DIR/api.env"
             umask 022
-            sed -i -E "s/-admin-token [^\\\\ ]+/-admin-token \${ADMIN_TOKEN}/; s/-internal-secret [^\\\\ ]+/-internal-secret \${INTERNAL_SECRET}/" "$API_UNIT"
+            # 0.11: флаги удаляем совсем (systemd разворачивает ${VAR} до exec,
+            # токен всё равно виден в ps). Удаление с учётом продолжений ExecStart «\»:
+            # если после удаления флагов последняя строка ExecStart кончается «\» — срезаем.
+            TMP_UNIT=$(mktemp)
+            awk '
+                /^ExecStart=/ && !blk { blk=1; n=0 }
+                blk {
+                    if ($0 ~ /-admin-token / || $0 ~ /-internal-secret /) next
+                    buf[++n]=$0
+                    if ($0 !~ /\\$/) {
+                        sub(/\\$/, "", buf[n])
+                        for (i=1;i<=n;i++) print buf[i]
+                        n=0; blk=0
+                    }
+                    next
+                }
+                { print }
+            ' "$API_UNIT" > "$TMP_UNIT" && mv -f "$TMP_UNIT" "$API_UNIT"
             if ! grep -q "EnvironmentFile=" "$API_UNIT"; then
                 sed -i "/^\[Service\]$/a EnvironmentFile=$INSTALL_DIR/api.env" "$API_UNIT"
             fi
@@ -150,6 +177,28 @@ EOF
         else
             warn "Не удалось извлечь токены из юнита — проверь $API_UNIT вручную"
         fi
+    fi
+    # 0.11: у юнитов, мигрированных ранее в форму ${ADMIN_TOKEN}, токены всё ещё
+    # видны в ps (systemd разворачивает переменные до exec). Если api.env полный —
+    # вычищаем остаточные флаги совсем.
+    if grep -q -- "-admin-token" "$API_UNIT" && [ -f "$INSTALL_DIR/api.env" ] \
+       && grep -q '^ADMIN_TOKEN=' "$INSTALL_DIR/api.env" && grep -q '^INTERNAL_SECRET=' "$INSTALL_DIR/api.env"; then
+        TMP_UNIT=$(mktemp)
+        awk '
+            /^ExecStart=/ && !blk { blk=1; n=0 }
+            blk {
+                if ($0 ~ /-admin-token / || $0 ~ /-internal-secret /) next
+                buf[++n]=$0
+                if ($0 !~ /\\$/) {
+                    sub(/\\$/, "", buf[n])
+                    for (i=1;i<=n;i++) print buf[i]
+                    n=0; blk=0
+                }
+                next
+            }
+            { print }
+        ' "$API_UNIT" > "$TMP_UNIT" && mv -f "$TMP_UNIT" "$API_UNIT"
+        info "Остаточные -admin-token/-internal-secret удалены из юнита (0.11)"
     fi
     # G9: PUBLIC_URL (host:port без схемы) — иначе поле link в ответе create будет 127.0.0.1:7000.
     # Не трогаем, если уже задан в api.env или флагом -public-url в юните.

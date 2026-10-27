@@ -32,24 +32,29 @@ API_PORT=7000
 # ── Проверка root ──────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Запускай от root: sudo bash install.sh"
 
-# verify_sha256 FILE ASSET — проверка по SHA256SUMS из релиза vkserv (F5).
-# Если SHA256SUMS в релизе нет (старые релизы), молча пропускаем — релиз v1.0.3+ обязан его содержать.
+# verify_sha256 FILE ASSET — обязательная проверка по SHA256SUMS из релиза vkserv (F5).
+# Проверка обязательна, обхода нет: если SHA256SUMS не скачался или в нём нет записи
+# для ассета — это ошибка установки (fail-closed), а не молчаливый пропуск.
 verify_sha256() {
     local file="$1" asset="$2"
-    [ -n "${SKIP_SHA:-}" ] && return 0
-    local sums
+    local sums want got
     sums=$(mktemp)
-    if wget -q -O "$sums" "$VKSERV_REPO/SHA256SUMS" 2>/dev/null; then
-        local want got
-        want=$(awk -v f="$asset" '{sub(/^\*/,"",$2)} $2==f{print $1}' "$sums" || true)
-        got=$(sha256sum "$file" | awk '{print $1}')
-        if [ -n "$want" ] && [ "$want" != "$got" ]; then
-            rm -f "$sums"
-            error "$asset: не совпал SHA-256 (ожидалось $want, получено $got) — файл релиза повреждён?"
-        fi
-        info "$asset: SHA-256 сверён"
+    if ! wget -q -O "$sums" "$VKSERV_REPO/SHA256SUMS" 2>/dev/null; then
+        rm -f "$sums"
+        error "$asset: не удалось скачать SHA256SUMS из релиза $VKSERV_VERSION — проверка целостности обязательна. Установка прервана; если релиз опубликован без SHA256SUMS, сообщите об этом."
+    fi
+    want=$(awk -v f="$asset" '{sub(/^\*/,"",$2)} $2==f{print $1}' "$sums" || true)
+    got=$(sha256sum "$file" | awk '{print $1}')
+    if [ -z "$want" ]; then
+        rm -f "$sums"
+        error "$asset: нет записи в SHA256SUMS релиза — проверка целостности обязательна"
+    fi
+    if [ "$want" != "$got" ]; then
+        rm -f "$sums"
+        error "$asset: не совпал SHA-256 (ожидалось $want, получено $got) — файл релиза повреждён?"
     fi
     rm -f "$sums"
+    info "$asset: SHA-256 сверён"
 }
 
 # download URL OUT [MIN_BYTES] — curl с повторами, затем wget; без --show-progress (ломается на старых wget).
@@ -256,6 +261,7 @@ masquerade:
     url: https://www.bing.com/
     rewriteHost: true
 EOF
+chmod 600 "$INSTALL_DIR/hy2.yaml"   # 0.12: внутри пароль hysteria2
 
 # ── Systemd сервисы ───────────────────────────────────────────────────────────
 step "Настройка systemd"
@@ -331,6 +337,8 @@ ${NOTIFY_URL:+NOTIFY_URL=$NOTIFY_URL}
 EOF
     chmod 600 $INSTALL_DIR/api.env
     umask 022
+    # Токены не попадают в ExecStart (0.11: видны в ps) — API берёт их из api.env
+    # (дефолты флагов -admin-token/-internal-secret = переменные ADMIN_TOKEN/INTERNAL_SECRET).
     cat > /etc/systemd/system/vkturn-api.service << EOF
 [Unit]
 Description=VKTurn API (subscription keys)
@@ -339,6 +347,7 @@ After=network.target vkturn-hy2.service
 [Service]
 Type=simple
 EnvironmentFile=$INSTALL_DIR/api.env
+UMask=0077
 ExecStart=$INSTALL_DIR/api \\
   -db $INSTALL_DIR/api.db \\
   -dir $INSTALL_DIR \\
@@ -346,9 +355,7 @@ ExecStart=$INSTALL_DIR/api \\
   -port $API_PORT \\
   -hy2-port $HY2_PORT \\
   -port-start $PORT_START \\
-  -port-end $PORT_END \\
-  -admin-token \${ADMIN_TOKEN} \\
-  -internal-secret \${INTERNAL_SECRET}
+  -port-end $PORT_END
 Restart=always
 RestartSec=3
 StandardOutput=append:$LOG_DIR/api.log
