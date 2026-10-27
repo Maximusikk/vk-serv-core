@@ -18,7 +18,7 @@ step()  { echo -e "\n${W}━━━ $* ━━━${N}"; }
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 # Версия закреплена: /latest указывает на релиз v1.0.0-user-only, где только APK (серверных бинарников нет)
-VKSERV_VERSION="${VKSERV_VERSION:-v1.2.0-server-binary}"
+VKSERV_VERSION="${VKSERV_VERSION:-v1.3.0-server-binary}"
 VKSERV_REPO="https://github.com/Maximusikk/vk-serv-core/releases/download/$VKSERV_VERSION"
 # Hysteria закреплена конкретной версией (F5): /latest может принести несовместимый релиз.
 HY2_VERSION="${HY2_VERSION:-app/v2.12.2}"
