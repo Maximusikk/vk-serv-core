@@ -227,6 +227,38 @@ EOF
         info "MASTER_TOKEN сгенерирован и добавлен в api.env"
         printf 'VKTURN_MASTER_TOKEN=%s\n' "$NEW_MASTER_TOKEN"
     fi
+    # 3.8: мягкая миграция MODE — если в api.env задан MODE=master (или ALSO_NODE=1),
+    # а в юните vkturn-api нет соответствующих флагов — добавляем их в конец блока
+    # ExecStart (с учётом продолжений «\»). Обычные node-установки (MODE=node или
+    # без MODE) не трогаем — их флаги опциональны, дефолт API = node.
+    if [ -f "$INSTALL_DIR/api.env" ]; then
+        migrate_exec_append() { # FLAG — добавить FLAG в конец блока ExecStart, если его там нет
+            local flag="$1" tmp
+            if grep -q -- "$flag" "$API_UNIT"; then return 0; fi
+            tmp=$(mktemp)
+            awk -v flag="$flag" '
+                /^ExecStart=/ { inblk=1; lines[n=1]=$0; next }
+                inblk {
+                    lines[++n]=$0
+                    if ($0 !~ /\\$/) {
+                        sub(/$/, " " flag, lines[n])
+                        for (i=1;i<=n;i++) print lines[i]
+                        inblk=0; n=0
+                    }
+                    next
+                }
+                { print }
+            ' "$API_UNIT" > "$tmp" && mv -f "$tmp" "$API_UNIT"
+        }
+        if grep -q '^MODE=master' "$INSTALL_DIR/api.env" && ! grep -q -- '-mode master' "$API_UNIT"; then
+            migrate_exec_append "-mode master"
+            info "-mode master добавлен в ExecStart $API_UNIT (миграция 3.8)"
+        fi
+        if grep -q '^ALSO_NODE=1' "$INSTALL_DIR/api.env" && ! grep -q -- '-also-node' "$API_UNIT"; then
+            migrate_exec_append "-also-node"
+            info "-also-node добавлен в ExecStart $API_UNIT (миграция 3.8)"
+        fi
+    fi
     if ufw status 2>/dev/null | grep "Status: active" >/dev/null; then
         ufw allow $API_PORT/tcp comment "VKTurn API" >/dev/null 2>&1 || true
     elif ! iptables -C INPUT -p tcp --dport $API_PORT -j ACCEPT 2>/dev/null; then

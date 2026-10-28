@@ -74,6 +74,38 @@ CREATE TABLE IF NOT EXISTS usage_log (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_log_id ON usage_log(id);
 CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
+-- Этап 3: ноды мастера
+CREATE TABLE IF NOT EXISTS servers (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	api          TEXT UNIQUE NOT NULL,
+	pin          TEXT NOT NULL,
+	master_token TEXT NOT NULL,
+	name         TEXT NOT NULL DEFAULT '',
+	status       TEXT NOT NULL DEFAULT 'active',  -- active | down | error
+	last_seen    INTEGER NOT NULL DEFAULT 0,
+	version      TEXT NOT NULL DEFAULT '',
+	capacity     INTEGER NOT NULL DEFAULT 0,
+	since        INTEGER NOT NULL DEFAULT 0       -- курсор usage (3.4)
+);
+-- Этап 3: подписки мастера (один ключ с одним external_id на каждой ноде)
+CREATE TABLE IF NOT EXISTS subscriptions (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	external_id TEXT UNIQUE NOT NULL,
+	name        TEXT NOT NULL DEFAULT '',
+	bytes_limit INTEGER NOT NULL DEFAULT 0,
+	expires_at  INTEGER NOT NULL DEFAULT 0,
+	bytes_used  INTEGER NOT NULL DEFAULT 0,
+	revoked_at  INTEGER
+);
+-- Этап 3: доставка ключа подписки на ноды
+CREATE TABLE IF NOT EXISTS subscription_servers (
+	sub_id    INTEGER NOT NULL,
+	server_id INTEGER NOT NULL,
+	key_id    TEXT NOT NULL DEFAULT '',
+	status    TEXT NOT NULL DEFAULT 'pending',  -- pending | active | failed
+	error     TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (sub_id, server_id)
+);
 `
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)

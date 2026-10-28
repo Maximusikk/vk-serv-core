@@ -410,6 +410,82 @@ curl -s --pinnedpubkey "sha256//$PIN_B64" -k https://203.0.113.10:7000/health
 реконсиляцией состояния по `/admin/keys` всё равно увидит факт отзыва/гашения.
 
 
+## Этап 3 — мастер (админ-сервер) /master/*
+
+Мастер — тот же бинарник vkturn-api в режиме `-mode master` (флаг `-also-node` — «быть ещё и нодой»).
+Мастер управляет списком нод и подписками: одна подписка = ключ с одним external_id на каждой
+активной ноде. Трафик юзеров идёт напрямую на ноды; при падении мастера сессии не рвутся.
+
+**Авторизация:** только `X-Admin-Token: <ADMIN_TOKEN>` мастера (master-token нод мастер НЕ принимает
+на /master/*; к нодам мастер сам ходит со своими master-token'ами). Все /master/* регистрируются
+также с /v1-алиасом.
+
+**Запуск:** `-mode master` — только мастер; `-mode master -also-node` — мастер + собственная нода
+(мастер регистрирует свою ноду тем же Go-клиентом с пином и MASTER_TOKEN, что и чужие, — через HTTP,
+без обходных путей).
+
+### Таблицы (db.go)
+
+- `servers(id INTEGER PK, api TEXT UNIQUE, pin TEXT, master_token TEXT, name TEXT, status TEXT active|down|error, last_seen INTEGER, version TEXT, capacity INTEGER, since INTEGER)` — `since` = курсор usage.
+- `subscriptions(id INTEGER PK, external_id TEXT UNIQUE, name TEXT, bytes_limit INTEGER, expires_at INTEGER, bytes_used INTEGER DEFAULT 0, revoked_at INTEGER)`.
+- `subscription_servers(sub_id, server_id, key_id, status TEXT pending|active|failed, error TEXT, PRIMARY KEY(sub_id, server_id))`.
+- join-токены: в памяти процесса (одноразовые, срок 1 час; переживать рестарт не требуется).
+
+### POST /master/join-tokens — выдать join-токен
+
+Ответ `200`: `{"token": "<hex>", "expires_at": <unix, +1 час>}`. Одноразовый: повторное использование → 403.
+
+### POST /master/join — регистрация ноды
+
+Тело: `{"token": "...", "api": "host:port", "pin": "<hex64 пин ноды>", "master_token": "<MASTER_TOKEN ноды>", "name": "...", "version": "v1.3.0", "capacity": 100}`.
+
+- Токен неизвестен/просрочен/уже использован → `403 {"error":"join token invalid or expired"}`.
+- `pin` не hex64 → `400`.
+- Нода добавляется/обновляется (по `api`) со `status=active`, `last_seen=now`.
+
+### POST /master/subscriptions — создать подписку
+
+Тело: `{"external_id": "...", "name": "...", "bytes_limit": <байты>, "expires_days": 30}`.
+
+Мастер синхронно создаёт ключ на каждой ноде со `status=active` через `POST /v1/admin/keys/create`
+(local_limit = bytes_limit, тем же pinned-клиентом). Ответ `200`:
+
+```json
+{
+  "id": 1, "external_id": "order-77", "name": "Подписка",
+  "bytes_limit": 10737418240, "expires_at": 0,
+  "servers": [{"server_id": 1, "api": "1.2.3.4:7000", "key_id": "…", "status": "active"}],
+  "bundle": "vkturn://bundle/<base64url JSON по 00d §1.3>"
+}
+```
+
+- Не ответившая нода остаётся `pending` (в `servers` ответа тоже видна со status=pending/failed и `error`);
+  фоновый цикл досылает раз в 30 с.
+- Ошибки нод НЕ глотаются: `subscription_servers.error` содержит текст.
+- `bundle` строится из доставленных ключей (null, если ни один не доставлен).
+
+### GET /master/servers — список нод
+
+`{"servers": [{id, api, name, status, last_seen, version, capacity, since}...]}`.
+
+### GET /master/subscriptions — список подписок
+
+`{"subscriptions": [{id, external_id, name, bytes_limit, bytes_used, expires_at, revoked_at,
+"servers": [{api, key_id, status, error}...]}...]}`.
+
+### Фоновые циклы мастера
+
+- **Досыл (30 с):** подписки с pending/failed серверами → create на недоставленных; успех → active, ошибка → failed + error.
+- **Трафик (60 с):** `GET /v1/admin/usage?since=<servers.since>` со всех нод; дельты суммируются в
+  `subscriptions.bytes_used` по key_id; курсор `servers.since` двигается только после успешного забора.
+  При `bytes_used >= bytes_limit` (лимит задан) или истечении `expires_at` — revoke на всех нодах
+  подписки и `revoked_at=now`.
+- **Health (30 с):** `GET /v1/admin/health` каждой ноды → `servers.status/last_seen`;
+  переход down→active и active→down — вебхук `node_down`/`node_up` (тот же NOTIFY_URL,
+  тело как у событий ключа + поле `api`).
+
+
+
 ## Запросы пользователя (без админского токена)
 
 ### POST /activate — активировать ключ

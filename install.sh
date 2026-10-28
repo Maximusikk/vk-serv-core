@@ -29,6 +29,28 @@ VKSERV_PORT=56000
 HY2_PORT=10443
 API_PORT=7000
 
+# ── Роль установки (3.8) ──────────────────────────────────────────────────────
+# ROLE=node (по умолчанию) | master | master+node
+#   node        — релейная нода (как раньше): hysteria2 + vkserv + api (режим ноды)
+#   master      — чистый админ-сервер: только api в режиме мастера (без hy2/vkserv/56000)
+#   master+node — то же, что node, но api работает в режиме мастера и как нода
+ROLE="${ROLE:-node}"
+case "$ROLE" in
+  node)        API_MODE="node";   IS_MASTER=0; NODE_INSTALL=1 ;;
+  master)      API_MODE="master"; IS_MASTER=1; NODE_INSTALL=0 ;;
+  master+node) API_MODE="master"; IS_MASTER=1; NODE_INSTALL=1 ;;
+  *) error "ROLE=$ROLE не поддерживается. Допустимо: node | master | master+node" ;;
+esac
+
+# 3.7: подключение ноды к мастеру (только для установок с нодой).
+# JOIN_URL или JOIN — адрес мастера вида https://<мастер>:7000.
+JOIN_URL="${JOIN_URL:-${JOIN:-}}"
+# JOIN_TOKEN — одноразовый токен с мастера (POST /v1/master/join-tokens).
+# JOIN_PIN — hex64 SPKI-пин сертификата МАСТЕРА (правило «пин до токена»).
+JOIN_TOKEN="${JOIN_TOKEN:-}"
+JOIN_PIN="${JOIN_PIN:-}"
+JOIN_CAPACITY="${JOIN_CAPACITY:-100}"
+
 # ── Проверка root ──────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "Запускай от root: sudo bash install.sh"
 
@@ -137,8 +159,9 @@ PORT_END=57000
 # и зашиты в итоговую ссылку vkturn://.
 info "Пароли сгенерированы (сохраняются в $INSTALL_DIR/config.txt)"
 
-# ── Ввод VK ссылки ────────────────────────────────────────────────────────────
+# ── Ввод VK ссылки (только для установок с нодой) ────────────────────────────
 step "VK звонок"
+if [ "$NODE_INSTALL" = "1" ]; then
 echo ""
 echo -e "${Y}Создай звонок в VK:${N}"
 echo "  1. Открой ВКонтакте → Звонки → Создать звонок → Конференция"
@@ -158,6 +181,11 @@ fi
 # Гарантирует безопасную запись в config.txt: без пробелов, переводов строк, $ и `.
 echo "$VK_LINK" | grep -qE '^https://vk\.(com|ru)/call/join/[A-Za-z0-9_-]+$' || error "Неверная ссылка. Ожидается https://vk.com/call/join/XXXX (латиница, цифры, _ или -)"
 info "VK ссылка принята"
+else
+    # Чистый мастер не раздаёт пользовательские конфиги — VK ссылка не нужна.
+    VK_LINK=""
+    info "Режим $ROLE: VK ссылка не требуется"
+fi
 
 # ── Остановка старых сервисов (при переустановке) ────────────────────────────
 for _svc in vkturn-api vkturn-server vkturn-hy2; do
@@ -188,14 +216,17 @@ $LOG_DIR/*.log {
 }
 EOF
 
-# ── Скачивание vkserv ─────────────────────────────────────────────────────────
+# ── Скачивание vkserv (только нода) ───────────────────────────────────────────
+if [ "$NODE_INSTALL" = "1" ]; then
 step "Загрузка vkserv"
 download "$VKSERV_REPO/server-linux-$ARCH_SUFFIX" "$INSTALL_DIR/server"
 chmod +x "$INSTALL_DIR/server"
 verify_sha256 "$INSTALL_DIR/server" "server-linux-$ARCH_SUFFIX"
 info "vkserv OK"
+fi
 
-# ── Скачивание hysteria2 ──────────────────────────────────────────────────────
+# ── Скачивание hysteria2 (только нода) ────────────────────────────────────────
+if [ "$NODE_INSTALL" = "1" ]; then
 step "Загрузка hysteria2 ($HY2_VERSION)"
 download "$HY2_REPO/hysteria-linux-$ARCH_SUFFIX" "$INSTALL_DIR/hysteria2" 1000000
 chmod +x "$INSTALL_DIR/hysteria2"
@@ -211,6 +242,7 @@ if wget -q -O "$INSTALL_DIR/.hy2.sha256" "$HY2_REPO/SHA256SUMS.txt" 2>/dev/null;
     info "hysteria2 OK (SHA-256 сверён)"
 else
     info "hysteria2 OK (SHA256SUMS.txt недоступен — сверить вручную: https://github.com/apernet/hysteria/releases/tag/$HY2_VERSION)"
+fi
 fi
 
 # ── API сервер подписок ───────────────────────────────────────────────────────
@@ -231,7 +263,8 @@ else
     warn "vkturn-api не найден в releases — админка недоступна (токены всё равно сохранены)"
 fi
 
-# ── TLS сертификат (для hysteria2; vkturn-api создаёт свой в $INSTALL_DIR/tls сам при первом старте) ──
+# ── TLS сертификат для hysteria2 (только нода; vkturn-api создаёт свой в $INSTALL_DIR/tls сам при первом старте) ──
+if [ "$NODE_INSTALL" = "1" ]; then
 step "Генерация TLS сертификата"
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:P-256 \
@@ -242,8 +275,10 @@ openssl req -x509 -newkey ec \
   -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null
 chmod 640 "$INSTALL_DIR/key.pem"
 info "Сертификат создан (10 лет)"
+fi
 
-# ── Конфиг hysteria2 ──────────────────────────────────────────────────────────
+# ── Конфиг hysteria2 (только нода) ────────────────────────────────────────────
+if [ "$NODE_INSTALL" = "1" ]; then
 step "Конфигурация hysteria2"
 cat > "$INSTALL_DIR/hy2.yaml" << EOF
 listen: 127.0.0.1:$HY2_PORT
@@ -265,10 +300,12 @@ EOF
 chmod 600 "$INSTALL_DIR/hy2.yaml"   # 0.12: внутри пароль hysteria2
 # 0.12: api.db может существовать при переустановке — новый файл создаст сам API под UMask=0077
 [ -f "$INSTALL_DIR/api.db" ] && chmod 600 "$INSTALL_DIR/api.db"
+fi
 
 # ── Systemd сервисы ───────────────────────────────────────────────────────────
 step "Настройка systemd"
 
+if [ "$NODE_INSTALL" = "1" ]; then
 # hysteria2
 cat > /etc/systemd/system/vkturn-hy2.service << EOF
 [Unit]
@@ -327,26 +364,43 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 TMPLEOF
+fi
 
 # API сервер (если скачался). Токены — в EnvironmentFile (F4): не светятся в
 # ExecStart (видны в systemctl show / ps), а отдельный файл ставится 600.
 if [ "$API_INSTALLED" = "1" ]; then
+    # ALSO_NODE=1 — только для master+node (нода подмастерье у самой себя)
+    ALSO_NODE_LINE=""
+    [ "$ROLE" = "master+node" ] && ALSO_NODE_LINE="1"
     umask 077
     cat > $INSTALL_DIR/api.env << EOF
 ADMIN_TOKEN=$ADMIN_TOKEN
 MASTER_TOKEN=$MASTER_TOKEN
 INTERNAL_SECRET=$INTERNAL_SECRET
 PUBLIC_URL=$SERVER_IP:$API_PORT
+MODE=$API_MODE
+${ALSO_NODE_LINE:+ALSO_NODE=1}
 ${NOTIFY_URL:+NOTIFY_URL=$NOTIFY_URL}
 EOF
     chmod 600 $INSTALL_DIR/api.env
     umask 022
     # Токены не попадают в ExecStart (0.11: видны в ps) — API берёт их из api.env
     # (дефолты флагов -admin-token/-internal-secret = переменные ADMIN_TOKEN/INTERNAL_SECRET).
+    # 3.8: режим фиксируем явно (-mode node/master, + -also-node для master+node).
+    API_UNIT_AFTER="network.target"
+    [ "$NODE_INSTALL" = "1" ] && API_UNIT_AFTER="network.target vkturn-hy2.service"
+    NODE_FLAGS=""
+    [ "$NODE_INSTALL" = "1" ] && NODE_FLAGS="\\
+  -hy2-port $HY2_PORT \\
+  -port-start $PORT_START \\
+  -port-end $PORT_END"
+    ALSO_NODE_FLAG=""
+    [ "$ROLE" = "master+node" ] && ALSO_NODE_FLAG=" \\
+  -also-node"
     cat > /etc/systemd/system/vkturn-api.service << EOF
 [Unit]
 Description=VKTurn API (subscription keys)
-After=network.target vkturn-hy2.service
+After=$API_UNIT_AFTER
 
 [Service]
 Type=simple
@@ -357,9 +411,7 @@ ExecStart=$INSTALL_DIR/api \\
   -dir $INSTALL_DIR \\
   -bind 0.0.0.0 \\
   -port $API_PORT \\
-  -hy2-port $HY2_PORT \\
-  -port-start $PORT_START \\
-  -port-end $PORT_END
+  -mode $API_MODE $ALSO_NODE_FLAG$NODE_FLAGS
 Restart=always
 RestartSec=3
 StandardOutput=append:$LOG_DIR/api.log
@@ -382,20 +434,24 @@ info "Порт SSH: $SSH_PORT"
 
 if ufw status 2>/dev/null | grep -qE 'Status: (active|inactive)'; then
     ufw allow "$SSH_PORT"/tcp comment "SSH"    >/dev/null 2>&1 || true
-    ufw allow $VKSERV_PORT/udp comment "VKTurn" >/dev/null 2>&1 || true
-    # Диапазон личных портов ключей — правилом ufw (переживает ufw reload, в отличие от одиночных iptables -I)
-    ufw allow $PORT_START:$PORT_END/udp comment "VKTurn keys" >/dev/null 2>&1 || true
+    if [ "$NODE_INSTALL" = "1" ]; then
+        ufw allow $VKSERV_PORT/udp comment "VKTurn" >/dev/null 2>&1 || true
+        # Диапазон личных портов ключей — правилом ufw (переживает ufw reload, в отличие от одиночных iptables -I)
+        ufw allow $PORT_START:$PORT_END/udp comment "VKTurn keys" >/dev/null 2>&1 || true
+    fi
     [ "$API_INSTALLED" = "1" ] && { ufw allow $API_PORT/tcp comment "VKTurn API" >/dev/null 2>&1 || true; }
     ufw --force enable >/dev/null 2>&1 || true
-    info "Порт $VKSERV_PORT/UDP открыт (ufw)"
+    [ "$NODE_INSTALL" = "1" ] && info "Порт $VKSERV_PORT/UDP открыт (ufw)"
     [ "$API_INSTALLED" = "1" ] && info "Порт $API_PORT/TCP (API) открыт (ufw)"
 else
-    iptables -I INPUT -p udp --dport $VKSERV_PORT -j ACCEPT 2>/dev/null && \
-        info "Порт $VKSERV_PORT/UDP открыт (iptables)" || \
-        warn "Порт $VKSERV_PORT/UDP: открой вручную в панели хостинга"
-    iptables -I INPUT -p udp --dport $PORT_START:$PORT_END -j ACCEPT 2>/dev/null && \
-        info "Диапазон $PORT_START:$PORT_END/UDP открыт (iptables)" || \
-        warn "Диапазон $PORT_START:$PORT_END/UDP: открой вручную в панели хостинга"
+    if [ "$NODE_INSTALL" = "1" ]; then
+        iptables -I INPUT -p udp --dport $VKSERV_PORT -j ACCEPT 2>/dev/null && \
+            info "Порт $VKSERV_PORT/UDP открыт (iptables)" || \
+            warn "Порт $VKSERV_PORT/UDP: открой вручную в панели хостинга"
+        iptables -I INPUT -p udp --dport $PORT_START:$PORT_END -j ACCEPT 2>/dev/null && \
+            info "Диапазон $PORT_START:$PORT_END/UDP открыт (iptables)" || \
+            warn "Диапазон $PORT_START:$PORT_END/UDP: открой вручную в панели хостинга"
+    fi
     if [ "$API_INSTALLED" = "1" ]; then
         iptables -I INPUT -p tcp --dport $API_PORT -j ACCEPT 2>/dev/null && \
             info "Порт $API_PORT/TCP (API) открыт (iptables)" || \
@@ -406,6 +462,7 @@ fi
 # ── Запуск сервисов ───────────────────────────────────────────────────────────
 step "Запуск сервисов"
 systemctl daemon-reload
+if [ "$NODE_INSTALL" = "1" ]; then
 systemctl enable --now vkturn-hy2.service
 sleep 2
 systemctl enable --now vkturn-server.service
@@ -421,6 +478,7 @@ if systemctl is-active --quiet vkturn-server.service; then
     info "vkserv: running ✓"
 else
     warn "vkserv не запустился. Лог: journalctl -u vkturn-server -n 20"
+fi
 fi
 
 TLS_PIN=""
@@ -467,16 +525,20 @@ if [ "$API_INSTALLED" = "1" ]; then
     rm -f "$INSTALL_DIR/tracker.sh"
 fi
 
-# ── Генерация vkturn:// ───────────────────────────────────────────────────────
+# ── Генерация vkturn:// (только нода) ─────────────────────────────────────────
 step "Генерация конфига для приложения"
+VKTURN_LINK=""
+if [ "$NODE_INSTALL" = "1" ]; then
 HY2_PROFILE="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=${SERVER_IP}&insecure=1#${SERVER_NAME}"
 JSON="{\"n\":\"${SERVER_NAME}\",\"peer\":\"${SERVER_IP}:${VKSERV_PORT}\",\"vk\":\"${VK_LINK}\",\"pwd\":\"${WRAP_PASS}\",\"profile\":\"${HY2_PROFILE}\"${TLS_PIN:+,\"pin\":\"${TLS_PIN}\"}}"
 B64=$(echo -n "$JSON" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 VKTURN_LINK="vkturn://v1/${B64}"
+fi
 
 # ── Сохраняем конфиг ──────────────────────────────────────────────────────────
 cat > "$INSTALL_DIR/config.txt" << EOF
 # VKTurn конфиг — $(date)
+ROLE=$ROLE
 SERVER_IP=$SERVER_IP
 VKSERV_PORT=$VKSERV_PORT
 HY2_PORT=$HY2_PORT
@@ -499,6 +561,9 @@ echo -e "${G}╔═════════════════════�
 echo -e "${G}║              ✅  VKTurn успешно установлен               ║${N}"
 echo -e "${G}╚══════════════════════════════════════════════════════════╝${N}"
 echo ""
+echo -e "${W}Роль:${N} $ROLE"
+
+if [ "$NODE_INSTALL" = "1" ] && [ -n "$VKTURN_LINK" ]; then
 echo -e "${W}Ссылка для импорта:${N}"
 echo ""
 echo "$VKTURN_LINK"
@@ -508,11 +573,64 @@ if command -v qrencode &>/dev/null; then
     qrencode -t ANSIUTF8 -m 1 "$VKTURN_LINK"
     echo ""
 fi
+fi
+
+# 3.7: регистрация этой ноды на мастере (JOIN_URL/JOIN + JOIN_TOKEN + JOIN_PIN).
+# Нода уже установлена и запущена, TLS_PIN её API известен — регистрируем.
+JOIN_STATUS=0
+if [ "$NODE_INSTALL" = "1" ] && [ -n "$JOIN_URL" ]; then
+    if [ -z "$JOIN_TOKEN" ]; then
+        warn "JOIN_URL задан, но JOIN_TOKEN пуст — регистрация на мастере пропущена. Выдай join-токен на мастере и перезапусти: JOIN_URL=... JOIN_TOKEN=... JOIN_PIN=... bash install.sh (или FORCE_REINSTALL=1)"
+    elif [ -z "$JOIN_PIN" ]; then
+        warn "JOIN_URL задан, но JOIN_PIN пуст — регистрация НЕ выполнена. Пин мастера обязателен (правило «пин до токена»): получи TLS_PIN мастера и передай JOIN_PIN=<hex64>"
+    elif [ -z "$TLS_PIN" ]; then
+        warn "Не определён собственный TLS-пин ноды — регистрация на мастере пропущена (нечего отправлять в поле pin)"
+    else
+        step "Регистрация ноды на мастере"
+        # hex64 → base64 для --pinnedpubkey (xxd из vim-common; fallback — printf+sed,
+        # тот же приём, что для собственного пина API ниже по скрипту).
+        if command -v xxd >/dev/null 2>&1; then
+            JOIN_PIN_B64=$(echo "$JOIN_PIN" | xxd -r -p | base64 | tr -d '\n' || true)
+        else
+            JOIN_PIN_B64=$(printf "$(printf '%s' "$JOIN_PIN" | sed 's/../\\x&/g')" | base64 | tr -d '\n' || true)
+        fi
+        echo "$JOIN_PIN" | grep -qE '^[0-9a-fA-F]{64}$' || JOIN_PIN_B64=""
+        if [ -z "$JOIN_PIN_B64" ]; then
+            warn "JOIN_PIN не похож на hex64 SPKI-пин — регистрация НЕ выполнена"
+        else
+            # JOIN_URL допускается без схемы — по умолчанию HTTPS
+            case "$JOIN_URL" in
+                http://*|https://*) : ;;
+                *) JOIN_URL="https://$JOIN_URL" ;;
+            esac
+            JOIN_URL="${JOIN_URL%/}"
+            JOIN_HTTP=$(curl -sS --max-time 20 -k --pinnedpubkey "sha256//$JOIN_PIN_B64" \
+                -w '\n%{http_code}' -X POST "$JOIN_URL/v1/master/join" \
+                -H "Content-Type: application/json" \
+                -d "{\"token\":\"$JOIN_TOKEN\",\"api\":\"$SERVER_IP:$API_PORT\",\"pin\":\"$TLS_PIN\",\"master_token\":\"$MASTER_TOKEN\",\"name\":\"$(hostname)\",\"version\":\"${VKSERV_VERSION%%-*}\",\"capacity\":$JOIN_CAPACITY}" 2>/tmp/vkturn-join.err) \
+                && JOIN_HTTP_OK=1 || JOIN_HTTP_OK=0
+            JOIN_BODY=$(echo "$JOIN_HTTP" | sed '$d')
+            JOIN_CODE=$(echo "$JOIN_HTTP" | tail -n1)
+            if [ "$JOIN_HTTP_OK" = "1" ] && [ "$JOIN_CODE" = "200" ] && grep -q '"registered"' <<<"$JOIN_BODY"; then
+                JOIN_STATUS=1
+                info "Нода зарегистрирована на мастере $JOIN_URL ✓"
+                printf 'VKTURN_JOIN_STATUS=registered\n'
+            elif [ "$JOIN_HTTP_OK" = "1" ] && [ "$JOIN_CODE" = "403" ]; then
+                warn "Мастер отклонил join-токен (403: join token invalid or expired). Токен одноразовый и живёт 1 час — выдай новый на мастере: curl -k -X POST $JOIN_URL/v1/master/join-tokens -H 'X-Admin-Token: <ADMIN_TOKEN мастера>'"
+            else
+                JOIN_ERR=""
+                [ -s /tmp/vkturn-join.err ] && JOIN_ERR=" (stderr: $(tail -n1 /tmp/vkturn-join.err))"
+                warn "Не удалось зарегистрироваться на мастере (код: ${JOIN_CODE:-нет}). Ответ: ${JOIN_BODY:-пусто}${JOIN_ERR}"
+            fi
+        fi
+    fi
+fi
 
 # Вывод без ANSI — для парсинга приложением
 printf 'VKTURN_ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
 printf 'VKTURN_MASTER_TOKEN=%s\n' "$MASTER_TOKEN"
 if [ -n "$TLS_PIN" ]; then printf 'VKTURN_ADMIN_PIN=%s\n' "$TLS_PIN"; fi
+if [ "$ROLE" != "node" ]; then printf 'VKTURN_ROLE=%s\n' "$ROLE"; fi
 
 if [ "$API_INSTALLED" = "1" ]; then
     echo -e "${W}Admin token:${N} $ADMIN_TOKEN"
@@ -544,7 +662,27 @@ fi
 
 echo ""
 echo -e "${W}Конфиг:${N} $INSTALL_DIR/config.txt"
-echo -e "${W}Логи:${N}  journalctl -u vkturn-hy2 -u vkturn-server -f"
+if [ "$NODE_INSTALL" = "1" ]; then
+    echo -e "${W}Логи:${N}  journalctl -u vkturn-hy2 -u vkturn-server -f"
+else
+    echo -e "${W}Логи:${N}  journalctl -u vkturn-api -f"
+fi
+
+# ── Подсказки мастера (3.7) ───────────────────────────────────────────────────
+if [ "$IS_MASTER" = "1" ] && [ "$API_INSTALLED" = "1" ]; then
+    echo ""
+    echo -e "${W}Мастер запущен: https://$SERVER_IP:$API_PORT (режим: $ROLE)${N}"
+    echo -e "${W}1. Выдать join-токен для новой ноды:${N}"
+    echo "  curl -k -X POST https://$SERVER_IP:$API_PORT/v1/master/join-tokens \\"
+    echo "    -H 'X-Admin-Token: $ADMIN_TOKEN'"
+    echo "  → {\"token\":\"<hex>\",\"expires_at\":<unix,+1ч>} (одноразовый)"
+    echo -e "${W}2. Зарегистрировать ноду (на самой ноде):${N}"
+    echo "  JOIN_URL=https://$SERVER_IP:$API_PORT JOIN_TOKEN=<hex> JOIN_PIN=<TLS_PIN мастера> bash install.sh"
+    echo "  (JOIN_PIN — строка TLS_PIN= из config.txt мастера; нода получает его от владельца вручную)"
+    if [ "$NODE_INSTALL" = "0" ]; then
+        echo -e "${Y}Режим master без -also-node: hysteria2 и vkserv не установлены — это чистый админ-сервер.${N}"
+    fi
+fi
 echo ""
 
 # ── Скрипт обновления VK ссылки ──────────────────────────────────────────────

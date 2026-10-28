@@ -46,6 +46,9 @@ type Config struct {
 
 	ReconcileInterval time.Duration // период reconcile-цикла портов (1.3); 0 = дефолт 20 с
 
+	Mode     string // этап 3: "node" (по умолчанию) | "master"
+	AlsoNode bool   // этап 3: в режиме master — быть ещё и нодой
+
 	TLSDir string // каталог api.crt/api.key (S1); по умолчанию /opt/vkturn/tls
 	TLSPin string // SPKI-пин сертификата API: hex SHA-256, 64 символа (не секрет)
 }
@@ -89,6 +92,9 @@ func main() {
 		tlsDir = defaultTLSDir
 	}
 	flag.StringVar(&cfg.TLSDir, "tls-dir", tlsDir, "каталог TLS-сертификата API (api.crt/api.key; создаётся при первом старте)")
+	// Этап 3: -mode master — режим админ-сервера; -also-node — быть ещё и нодой
+	flag.StringVar(&cfg.Mode, "mode", "node", "режим: node (по умолчанию) | master")
+	flag.BoolVar(&cfg.AlsoNode, "also-node", false, "в режиме master: быть ещё и нодой (регистрирует себя как ноду)")
 	flag.Parse()
 
 	nets, err := parseAllowList(cfg.AdminAllow)
@@ -125,6 +131,17 @@ func main() {
 	defer sqlDB.Close()
 
 	srv := NewServer(sqlDB.DB, cfg)
+
+	// Этап 3: в режиме master запускаются циклы мастера и (при -also-node)
+	// собственная нода регистрируется тем же pinned-клиентом, что и чужие.
+	if cfg.Mode == masterMode {
+		go srv.runMasterCycles(context.Background())
+		if cfg.AlsoNode {
+			if err := srv.registerSelfNode(); err != nil {
+				log.Fatalf("master: саморегистрация ноды: %v", err)
+			}
+		}
+	}
 
 	// Шаблон vkserv@ с учётом трафика + iptables после перезагрузки, затем фоновые циклы:
 	// учёт трафика и гашение ключей с истёкшим сроком

@@ -57,6 +57,20 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	}))
 	reg("/admin/stats", s.adminMiddleware(s.handleAdminStats))
 
+	// Этап 3: мастер (авторизация — только admin-token мастера). В режиме node отвечают 501.
+	reg("/master/join-tokens", s.adminMiddleware(s.handleMasterJoinTokens))
+	// join вызывает НОВАЯ нода (install.sh JOIN_*): admin-tokenа мастера у неё нет и быть не должно.
+	// Авторизация — одноразовый join-токен (192 бита) + лимит по IP, как у /activate.
+	reg("/master/join", rateLimitMiddleware(s.activateLimiter, s.handleMasterJoin))
+	reg("/master/subscriptions", s.adminMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			s.handleMasterCreateSub(w, r)
+		} else {
+			s.handleMasterListSubs(w, r)
+		}
+	}))
+	reg("/master/servers", s.adminMiddleware(s.handleMasterListServers))
+
 	// Внутренние (за проверкой X-Internal)
 	reg("/internal/traffic", s.handleInternalTraffic)
 }
