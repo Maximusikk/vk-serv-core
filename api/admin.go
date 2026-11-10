@@ -56,6 +56,32 @@ func masterTokenAllowed(path string) bool {
 	return path == "/admin/health" || path == "/admin/usage" || strings.HasPrefix(path, "/admin/keys")
 }
 
+// masterTokenMiddleware — операции реестра нод (DELETE /master/servers/{id},
+// POST /master/join-tokens): только X-Master-Token владельца. Админ-токен (он у
+// продавца) ноды удалять и join-токены выпускать не должен: join-токен позволяет
+// зарегистрировать в реестре посторонний сервер и получить раскатку ключей.
+// Allowlist IP и лимитер неудач — те же, что у adminMiddleware.
+func (s *Server) masterTokenMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.adminAllowed(r) {
+			jsonError(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		ip := clientIP(r)
+		if s.adminAuthLimiter.blocked(ip) {
+			w.Header().Set("Retry-After", "60")
+			jsonError(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		if !secretEqual(r.Header.Get("X-Master-Token"), s.cfg.MasterToken) {
+			s.adminAuthLimiter.record(ip)
+			jsonError(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // secretEqual — constant-time сравнение секрета (пустые значения никогда не равны).
 func secretEqual(got, want string) bool {
 	if got == "" || want == "" {

@@ -563,17 +563,13 @@ func parsePinHex(v string) string {
 	return v
 }
 
-// ── DELETE /master/servers/{id} ─────────────────────────────────────────────────
-
-// handleMasterDeleteServer удаляет ноду из реестра мастера.
-// Best-effort: пытается удалить ключи всех подписок на этой ноде (если она доступна),
-// затем убирает запись сервера и все subscription_servers для него.
-// Если нода недоступна — ключи на ней останутся, но мастер про неё забудет.
 // handleMasterPeek — GET /v1/peek
 // Публичный (только user_token), режим мастера.
 // Возвращает свежий bundle подписки, к которой привязан токен.
 // Клиент вызывает при старте: если bundle изменился (ноды добавлены/удалены) —
 // переактивирует группу и обновляет список серверов.
+// Подписка находится по локальному ключу (self-доставка): при раскатке на мастер
+// как ноду ключ создаётся и в локальной таблице keys с user_token.
 func (s *Server) handleMasterPeek(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w) { return }
 	if r.Method != http.MethodGet {
@@ -585,10 +581,10 @@ func (s *Server) handleMasterPeek(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "authorization required", http.StatusUnauthorized)
 		return
 	}
-	// Находим подписку по user_token любой ноды в subscription_servers
+	// Находим подписку по user_token локального ключа (self-доставка подписки)
 	var subID int64
 	err := s.db.QueryRow(`
-		SELECT ss.subscription_id
+		SELECT ss.sub_id
 		FROM subscription_servers ss
 		JOIN keys k ON k.id = ss.key_id
 		WHERE k.user_token = ?
@@ -609,6 +605,14 @@ func (s *Server) handleMasterPeek(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── DELETE /master/servers/{id} ─────────────────────────────────────────────────
+
+// handleMasterDeleteServer удаляет ноду из реестра мастера.
+// Best-effort: пытается удалить ключи всех подписок на этой ноде (если она доступна),
+// затем убирает запись сервера и все subscription_servers для него.
+// Если нода недоступна — ключи на ней останутся, но мастер про неё забудет.
+// Авторизация — X-Master-Token (masterTokenMiddleware): удаление ноды недоступно
+// админ-токену продавца.
 func (s *Server) handleMasterDeleteServer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w) {
 		return
@@ -687,13 +691,9 @@ func (s *Server) handleMasterDeleteSub(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// id — последний сегмент пути (/master/subscriptions/{id}, с /v1 или без)
-	p := strings.TrimPrefix(r.URL.Path, "/v1")
-	p = strings.TrimPrefix(p, "/master/subscriptions/")
-	p = strings.TrimSuffix(p, "/")
-	id, err := strconv.ParseInt(p, 10, 64)
-	if err != nil || id <= 0 {
-		jsonError(w, "subscription id required", http.StatusBadRequest)
+	// id — сегмент пути /master/subscriptions/{id} (с /v1 или без)
+	id, ok := subIDFromSubPath(w, r, "")
+	if !ok {
 		return
 	}
 
@@ -745,4 +745,245 @@ func (s *Server) handleMasterDeleteSub(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[master] подписка %d (%s) удалена: ключей удалено %d/%d", id, sub.ExternalID, deleted, len(results))
 	jsonOK(w, map[string]any{"status": "deleted", "id": id, "deleted": deleted, "servers": results})
+}
+
+// ── Жизненный цикл подписки: продление, докупка, отзыв, unbind ─────────────────
+// Срок и лимиты подписки живут в ключах на нодах (в subscriptions нет колонок
+// duration/expires — см. restoreExpiresDays): операции — fan-out на доставленные
+// ключи через nodeCall. Статусы доставки при сбое операции НЕ меняются: ключ
+// существует, сбой — ошибка вызова, она честно возвращается в results.
+
+// subOpResult — исход операции на одной ноде.
+type subOpResult struct {
+	API    string `json:"api"`
+	KeyID  string `json:"key_id"`
+	Status string `json:"status"` // ok | failed | skipped
+	Error  string `json:"error,omitempty"`
+}
+
+// fanoutSubOp применяет op к каждой доставке подписки со статусом active:
+// pending/failed (ключа ещё нет) и недоступные ноды пропускаются.
+// Возвращает results и число успешных нод.
+func (s *Server) fanoutSubOp(subID int64, op func(n nodeRow, ss subServerRow) error) ([]subOpResult, int) {
+	servers, _ := s.subServers(subID)
+	nodes, _ := s.listNodes()
+	byID := make(map[int64]nodeRow, len(nodes))
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	results := make([]subOpResult, 0, len(servers))
+	okN := 0
+	for _, ss := range servers {
+		res := subOpResult{API: ss.API, KeyID: ss.KeyID, Status: "skipped"}
+		if ss.Status == subActive && ss.KeyID != "" {
+			if n, found := byID[ss.ServerID]; found && n.Status == "active" {
+				if err := op(n, ss); err != nil {
+					res.Status, res.Error = "failed", err.Error()
+				} else {
+					res.Status = "ok"
+					okN++
+				}
+			} else {
+				res.Status, res.Error = "failed", "нода недоступна"
+			}
+		}
+		results = append(results, res)
+	}
+	return results, okN
+}
+
+// subIDFromSubPath — числовой id подписки из пути
+// /master/subscriptions/{id}[/action] (с /v1 или без). При ошибке уже записал 400.
+func subIDFromSubPath(w http.ResponseWriter, r *http.Request, action string) (int64, bool) {
+	p := strings.TrimPrefix(r.URL.Path, "/v1")
+	p = strings.TrimPrefix(p, "/master/subscriptions/")
+	p = strings.TrimSuffix(p, "/")
+	if action != "" {
+		p = strings.TrimSuffix(p, "/"+action)
+	}
+	id, err := strconv.ParseInt(p, 10, 64)
+	if err != nil || id <= 0 {
+		jsonError(w, "subscription id required", http.StatusBadRequest)
+		return 0, false
+	}
+	return id, true
+}
+
+// subForOp — загрузить подписку или ответить 404. false = ответ уже отправлен.
+func (s *Server) subForOp(w http.ResponseWriter, id int64) (subRow, bool) {
+	var sub subRow
+	if err := scanSub(s.db.QueryRow(`SELECT `+subCols+` FROM subscriptions WHERE id = ?`, id), &sub); err != nil {
+		jsonError(w, "subscription not found", http.StatusNotFound)
+		return subRow{}, false
+	}
+	return sub, true
+}
+
+// handleMasterPatchSub — PATCH /master/subscriptions/{id}: продление подписки.
+// expires_days добавляются к сроку каждого доставленного ключа (семантика PATCH
+// ключа: активированный — от конца срока или от сегодня, если истёк; ожидающий
+// активации — к duration_days). Досыл отложенных нод (resendPending) читает срок
+// с активной доставки — продление унаследуется автоматически.
+func (s *Server) handleMasterPatchSub(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
+	if r.Method != http.MethodPatch {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := subIDFromSubPath(w, r, "")
+	if !ok {
+		return
+	}
+	if _, found := s.subForOp(w, id); !found {
+		return
+	}
+	var req struct {
+		ExpiresDays int64 `json:"expires_days"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ExpiresDays <= 0 || req.ExpiresDays > maxExpiresDays {
+		jsonError(w, "expires_days must be between 1 and 3650", http.StatusBadRequest)
+		return
+	}
+	body := map[string]any{"expires_days": req.ExpiresDays}
+	results, okN := s.fanoutSubOp(id, func(n nodeRow, ss subServerRow) error {
+		return s.nodeCall(n, http.MethodPatch, "/v1/admin/keys/"+ss.KeyID, body, nil)
+	})
+	log.Printf("[master] подписка %d: продление +%d д, нод ok %d/%d", id, req.ExpiresDays, okN, len(results))
+	resp := s.subscriptionResponse(id, okN)
+	resp["status"] = "updated"
+	resp["expires_days_added"] = req.ExpiresDays
+	resp["results"] = results
+	jsonOK(w, resp)
+}
+
+// handleMasterAddTrafficSub — POST /master/subscriptions/{id}/add_traffic.
+// Прибавляет bytes к bytes_limit подписки и выставляет новый общий лимит
+// (bytes_limit + local_limit) ключам на всех доставленных нодах — нода сама
+// переподнимет погашенный по лимиту порт (reprovisionIfDowned).
+func (s *Server) handleMasterAddTrafficSub(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := subIDFromSubPath(w, r, "add_traffic")
+	if !ok {
+		return
+	}
+	sub, found := s.subForOp(w, id)
+	if !found {
+		return
+	}
+	var req struct {
+		Bytes int64 `json:"bytes"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Bytes <= 0 {
+		jsonError(w, "bytes must be > 0", http.StatusBadRequest)
+		return
+	}
+	if sub.BytesLimit == 0 {
+		jsonError(w, "subscription has no bytes limit (unlimited) — nothing to add", http.StatusBadRequest)
+		return
+	}
+	newLimit := sub.BytesLimit + req.Bytes
+	if newLimit <= sub.BytesLimit { // переполнение int64
+		jsonError(w, "bytes_limit overflow", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE subscriptions SET bytes_limit = ? WHERE id = ?`, newLimit, id); err != nil {
+		jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body := map[string]any{"bytes_limit": newLimit, "local_limit": newLimit}
+	results, okN := s.fanoutSubOp(id, func(n nodeRow, ss subServerRow) error {
+		return s.nodeCall(n, http.MethodPatch, "/v1/admin/keys/"+ss.KeyID, body, nil)
+	})
+	log.Printf("[master] подписка %d: +%d байт (лимит %d), нод ok %d/%d", id, req.Bytes, newLimit, okN, len(results))
+	resp := s.subscriptionResponse(id, okN)
+	resp["status"] = "updated"
+	resp["bytes_added"] = req.Bytes
+	resp["bytes_limit"] = newLimit
+	resp["results"] = results
+	jsonOK(w, resp)
+}
+
+// handleMasterRevokeSub — POST /master/subscriptions/{id}/revoke: отзыв подписки.
+// Гасит ключи на всех доставленных нодах и ставит revoked_at (идемпотентно:
+// повторный вызов не трогает ноды и возвращает текущее состояние).
+func (s *Server) handleMasterRevokeSub(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := subIDFromSubPath(w, r, "revoke")
+	if !ok {
+		return
+	}
+	sub, found := s.subForOp(w, id)
+	if !found {
+		return
+	}
+	if sub.RevokedAt.Valid {
+		resp := s.subscriptionResponse(id, 0)
+		resp["status"] = "revoked"
+		resp["already_revoked"] = true
+		jsonOK(w, resp)
+		return
+	}
+	now := time.Now().Unix()
+	if _, err := s.db.Exec(`UPDATE subscriptions SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?`, now, id); err != nil {
+		jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	results, okN := s.fanoutSubOp(id, func(n nodeRow, ss subServerRow) error {
+		return s.nodeCall(n, http.MethodPost, "/v1/admin/keys/"+ss.KeyID+"/revoke", nil, nil)
+	})
+	log.Printf("[master] подписка %d (%s) отозвана: нод ok %d/%d", id, sub.ExternalID, okN, len(results))
+	resp := s.subscriptionResponse(id, okN)
+	resp["status"] = "revoked"
+	resp["revoked_at"] = now
+	resp["results"] = results
+	jsonOK(w, resp)
+}
+
+// handleMasterUnbindSub — POST /master/subscriptions/{id}/unbind: смена
+// устройства для всей подписки. Нодовый 7-дневный лимит (cfg.UnbindDays)
+// проверяется каждой нодой отдельно: часть нод может ответить 429 — это failed
+// в results, остальные отрабатывают.
+func (s *Server) handleMasterUnbindSub(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, ok := subIDFromSubPath(w, r, "unbind")
+	if !ok {
+		return
+	}
+	if _, found := s.subForOp(w, id); !found {
+		return
+	}
+	results, okN := s.fanoutSubOp(id, func(n nodeRow, ss subServerRow) error {
+		return s.nodeCall(n, http.MethodPost, "/v1/admin/keys/"+ss.KeyID+"/unbind", nil, nil)
+	})
+	log.Printf("[master] подписка %d: unbind, нод ok %d/%d", id, okN, len(results))
+	resp := s.subscriptionResponse(id, okN)
+	resp["status"] = "unbound"
+	resp["results"] = results
+	jsonOK(w, resp)
 }

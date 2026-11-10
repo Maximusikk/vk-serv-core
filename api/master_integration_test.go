@@ -42,7 +42,10 @@ type fakeNode struct {
 	keyN  int
 	keys  map[string]string   // external_id -> key_id
 	crBodies []map[string]any // тела keys/create
+	patches  map[string][]map[string]any // key_id -> тела PATCH (extend/traffic)
 	revoked  map[string]bool
+	unbound  map[string]bool
+	unbind429 map[string]bool // key_id -> отвечать 429 (7-дневный лимит)
 	usage []fakeUsage
 	up    bool
 }
@@ -58,6 +61,9 @@ func startFakeNode(t *testing.T, name string) *fakeNode {
 		pin:  spkiPin(cert.Leaf),
 		cert: cert,
 		keys: map[string]string{}, revoked: map[string]bool{},
+		patches:   map[string][]map[string]any{},
+		unbound:   map[string]bool{},
+		unbind429: map[string]bool{},
 	}
 	n.srv = &http.Server{Handler: n.mux()}
 	ls, err := net.Listen("tcp", "127.0.0.1:0")
@@ -128,6 +134,24 @@ func (n *fakeNode) createBody(extID string) map[string]any {
 	return nil
 }
 
+func (n *fakeNode) patchBodies(keyID string) []map[string]any {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.patches[keyID]
+}
+
+func (n *fakeNode) isUnbound(keyID string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.unbound[keyID]
+}
+
+func (n *fakeNode) setUnbind429(keyID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.unbind429[keyID] = true
+}
+
 func (n *fakeNode) mux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/admin/keys/create", func(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +194,25 @@ func (n *fakeNode) mux() http.Handler {
 			n.revoked[key] = true
 			n.mu.Unlock()
 			jsonOK(w, map[string]any{"ok": true})
+		case strings.HasSuffix(p, "/unbind"):
+			key := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/admin/keys/"), "/unbind")
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			if n.unbind429[key] {
+				jsonError(w, "unbind allowed once per 7 days; try again in 96 h", http.StatusTooManyRequests)
+				return
+			}
+			n.unbound[key] = true
+			jsonOK(w, map[string]any{"status": "unbound"})
+		case r.Method == http.MethodPatch:
+			key := strings.TrimPrefix(p, "/v1/admin/keys/")
+			var body map[string]any
+			raw, _ := io.ReadAll(r.Body)
+			json.Unmarshal(raw, &body)
+			n.mu.Lock()
+			n.patches[key] = append(n.patches[key], body)
+			n.mu.Unlock()
+			jsonOK(w, map[string]any{"status": "updated"})
 		case r.Method == http.MethodGet:
 			// Ключ трактуется как активированный: expires_at = now + 30 дней
 			// (нужно restoreExpiresDays при досыле).
@@ -185,9 +228,16 @@ func (n *fakeNode) mux() http.Handler {
 
 func masterCall(t *testing.T, mux *http.ServeMux, method, path, body string, wantCode int) map[string]any {
 	t.Helper()
+	return masterCallWithToken(t, mux, method, path, body, wantCode, "X-Admin-Token", "adm")
+}
+
+// masterCallWithToken — masterCall с произвольным авторизационным заголовком
+// (X-Master-Token для операций реестра нод).
+func masterCallWithToken(t *testing.T, mux *http.ServeMux, method, path, body string, wantCode int, header, token string) map[string]any {
+	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.RemoteAddr = "198.51.100.77:1111"
-	req.Header.Set("X-Admin-Token", "adm")
+	req.Header.Set(header, token)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -233,6 +283,7 @@ func TestMasterEndToEnd(t *testing.T) {
 	// MaxOpenConns(1), как в проде: GET /master/subscriptions не должен виснуть (регрессия дедлока).
 	s.cfg.Mode = masterMode
 	s.cfg.AdminToken = "adm"
+	s.cfg.MasterToken = "mtk" // операции реестра нод (join-tokens, DELETE servers)
 	s.cfg.NotifyURL = hookSrv.URL
 	mux := http.NewServeMux()
 	registerRoutes(mux, s)
@@ -244,7 +295,7 @@ func TestMasterEndToEnd(t *testing.T) {
 	// ── Join через одноразовые токены ────────────────────────────────────────────
 	join := func(n *fakeNode, mtok string) {
 		t.Helper()
-		out := masterCall(t, mux, "POST", "/v1/master/join-tokens", "", 200)
+		out := masterCallWithToken(t, mux, "POST", "/v1/master/join-tokens", "", 200, "X-Master-Token", "mtk")
 		tok, _ := out["token"].(string)
 		if tok == "" {
 			t.Fatal("join-tokens: пустой токен")
@@ -486,7 +537,7 @@ func TestMasterEndToEnd(t *testing.T) {
 	// ── 6. Неверный пин ноды: dispatch failed «tls pin mismatch», healthTick → down ──
 	node3 := startFakeNode(t, "n3")
 	// join с чужим (но валидным) пином — пин node1 вместо пина node3.
-	out3 := masterCall(t, mux, "POST", "/v1/master/join-tokens", "", 200)
+	out3 := masterCallWithToken(t, mux, "POST", "/v1/master/join-tokens", "", 200, "X-Master-Token", "mtk")
 	tok3, _ := out3["token"].(string)
 	masterCall(t, mux, "POST", "/v1/master/join", fmt.Sprintf(
 		`{"token":%q,"api":%q,"pin":%q,"master_token":"mt-3","name":"n3"}`,
@@ -516,4 +567,211 @@ func TestMasterEndToEnd(t *testing.T) {
 			t.Fatalf("нода 3 с неверным пином: status=%v, хочу down", m["status"])
 		}
 	}
+}
+
+// ── Жизненный цикл подписки: extend / add_traffic / revoke / unbind ─────────────
+
+func TestSubscriptionLifecycle(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.Mode = masterMode
+	s.cfg.AdminToken = "adm"
+	s.cfg.MasterToken = "mtk"
+	mux := http.NewServeMux()
+	registerRoutes(mux, s)
+
+	node1 := startFakeNode(t, "n1")
+	node2 := startFakeNode(t, "n2")
+	join := func(n *fakeNode, mtok string) {
+		t.Helper()
+		out := masterCallWithToken(t, mux, "POST", "/v1/master/join-tokens", "", 200, "X-Master-Token", "mtk")
+		tok, _ := out["token"].(string)
+		body := fmt.Sprintf(`{"token":%q,"api":%q,"pin":%q,"master_token":%q,"name":%q}`,
+			tok, n.addr, n.pin, mtok, n.name)
+		masterCall(t, mux, "POST", "/v1/master/join", body, 200)
+	}
+	join(node1, "mt-1")
+	join(node2, "mt-2")
+
+	out := masterCall(t, mux, "POST", "/v1/master/subscriptions",
+		`{"external_id":"lc-1","name":"LC","bytes_limit":1000,"expires_days":30}`, 200)
+	subID := int64(out["id"].(float64))
+	if got := int(out["delivered"].(float64)); got != 2 {
+		t.Fatalf("delivered = %d, хочу 2", got)
+	}
+
+	// ── Продление: fan-out PATCH {expires_days} на обе ноды ─────────────────────
+	// Подписки — под админ-токеном (токен продавца).
+	out = masterCall(t, mux, "PATCH", fmt.Sprintf("/v1/master/subscriptions/%d", subID), `{"expires_days":15}`, 200)
+	if st, _ := out["status"].(string); st != "updated" {
+		t.Fatalf("patch status = %v (%s)", out["status"], out["results"])
+	}
+	for _, nd := range []*fakeNode{node1, node2} {
+		bs := nd.patchBodies(nd.keyFor("lc-1"))
+		if len(bs) != 1 {
+			t.Fatalf("%s: патчей %d, хочу 1", nd.name, len(bs))
+		}
+		if d, _ := bs[0]["expires_days"].(float64); d != 15 {
+			t.Fatalf("%s: expires_days = %v, хочу 15", nd.name, bs[0]["expires_days"])
+		}
+	}
+	// Валидация: 0 и > 3650 → 400.
+	masterCall(t, mux, "PATCH", fmt.Sprintf("/v1/master/subscriptions/%d", subID), `{"expires_days":0}`, 400)
+	masterCall(t, mux, "PATCH", fmt.Sprintf("/v1/master/subscriptions/%d", subID), `{"expires_days":9999}`, 400)
+
+	// ── Докупка трафика: sub.bytes_limit растёт, ноды получают новый общий лимит ──
+	out = masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/add_traffic", subID), `{"bytes":500}`, 200)
+	if st, _ := out["status"].(string); st != "updated" {
+		t.Fatalf("add_traffic status = %v", out["status"])
+	}
+	var bl int64
+	if err := s.db.QueryRow(`SELECT bytes_limit FROM subscriptions WHERE id=?`, subID).Scan(&bl); err != nil || bl != 1500 {
+		t.Fatalf("sub bytes_limit = %d (err=%v), хочу 1500", bl, err)
+	}
+	for _, nd := range []*fakeNode{node1, node2} {
+		bs := nd.patchBodies(nd.keyFor("lc-1"))
+		if len(bs) != 2 {
+			t.Fatalf("%s: патчей %d, хочу 2 (extend + traffic)", nd.name, len(bs))
+		}
+		last := bs[len(bs)-1]
+		if v, _ := last["bytes_limit"].(float64); v != 1500 {
+			t.Fatalf("%s: bytes_limit = %v, хочу 1500", nd.name, last["bytes_limit"])
+		}
+		if v, _ := last["local_limit"].(float64); v != 1500 {
+			t.Fatalf("%s: local_limit = %v, хочу 1500", nd.name, last["local_limit"])
+		}
+	}
+
+	// Безлимитная подписка → 400 (паритет с нодой).
+	outU := masterCall(t, mux, "POST", "/v1/master/subscriptions",
+		`{"external_id":"lc-unlim","name":"U","bytes_limit":0,"expires_days":30}`, 200)
+	subU := int64(outU["id"].(float64))
+	masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/add_traffic", subU), `{"bytes":100}`, 400)
+
+	// ── Отзыв: revoked_at у подписки + revoke на обеих нодах, идемпотентно ───────
+	out = masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/revoke", subID), "", 200)
+	if st, _ := out["status"].(string); st != "revoked" {
+		t.Fatalf("revoke status = %v", out["status"])
+	}
+	if !node1.isRevoked(node1.keyFor("lc-1")) || !node2.isRevoked(node2.keyFor("lc-1")) {
+		t.Fatal("revoke не дошёл до нод")
+	}
+	var ra any
+	if err := s.db.QueryRow(`SELECT revoked_at FROM subscriptions WHERE id=?`, subID).Scan(&ra); err != nil || ra == nil {
+		t.Fatalf("revoked_at не выставлен (err=%v val=%v)", err, ra)
+	}
+	out = masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/revoke", subID), "", 200)
+	if v, _ := out["already_revoked"].(bool); !v {
+		t.Fatalf("повторный revoke: хочу already_revoked, got %v", out)
+	}
+
+	// ── Unbind: 200 на ноде 1, 429 на ноде 2 → частичный успех в results ────────
+	node2.setUnbind429(node2.keyFor("lc-1"))
+	out = masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/unbind", subID), "", 200)
+	results, _ := out["results"].([]any)
+	if len(results) != 2 {
+		t.Fatalf("unbind results = %d, хочу 2", len(results))
+	}
+	okCount, failCount := 0, 0
+	for _, v := range results {
+		m := v.(map[string]any)
+		switch m["status"] {
+		case "ok":
+			okCount++
+		case "failed":
+			failCount++
+			if e, _ := m["error"].(string); !strings.Contains(e, "429") {
+				t.Fatalf("unbind ошибка без 429: %v", m["error"])
+			}
+		default:
+			t.Fatalf("unbind: неожиданный статус %v", m["status"])
+		}
+	}
+	if okCount != 1 || failCount != 1 {
+		t.Fatalf("unbind: ok=%d failed=%d, хочу 1/1", okCount, failCount)
+	}
+	if !node1.isUnbound(node1.keyFor("lc-1")) || node2.isUnbound(node2.keyFor("lc-1")) {
+		t.Fatal("unbind применился не так: нода 1 должна отработать, нода 2 — 429")
+	}
+
+	// 404 на несуществующей подписке.
+	masterCall(t, mux, "PATCH", "/v1/master/subscriptions/999999", `{"expires_days":5}`, 404)
+	masterCall(t, mux, "POST", "/v1/master/subscriptions/999999/revoke", "", 404)
+
+	// ── Гейтинг реестра нод: админ-токен (продавец) не может ────────────────────
+	masterCall(t, mux, "POST", "/v1/master/join-tokens", "", 401)
+	var nodeID int64
+	if err := s.db.QueryRow(`SELECT id FROM servers WHERE api=?`, node1.addr).Scan(&nodeID); err != nil {
+		t.Fatal(err)
+	}
+	masterCall(t, mux, "DELETE", fmt.Sprintf("/v1/master/servers/%d", nodeID), "", 401)
+	// …а владелец с X-Master-Token может.
+	masterCallWithToken(t, mux, "DELETE", fmt.Sprintf("/v1/master/servers/%d", nodeID), "", 200, "X-Master-Token", "mtk")
+}
+
+// /peek после фикса (ss.sub_id): по user_token локального ключа (self-доставка)
+// находится подписка и возвращается свежий bundle.
+func TestPeekBundle(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.Mode = masterMode
+	s.cfg.AdminToken = "adm"
+	mux := http.NewServeMux()
+	registerRoutes(mux, s)
+
+	// нода в реестре + подписка с одной доставкой на неё
+	if _, err := s.db.Exec(`INSERT INTO servers (api, pin, master_token, name, status, last_seen, version, capacity, since)
+		VALUES ('127.0.0.1:65500', ?, 'mt', 'self', 'active', 0, '', 0, 0)`, strings.Repeat("ab", 32)); err != nil {
+		t.Fatal(err)
+	}
+	var srvID int64
+	if err := s.db.QueryRow(`SELECT id FROM servers WHERE api='127.0.0.1:65500'`).Scan(&srvID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO subscriptions (external_id, name, bytes_limit, expires_at) VALUES ('peek-1', 'P', 1000, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	var subID int64
+	if err := s.db.QueryRow(`SELECT id FROM subscriptions WHERE external_id='peek-1'`).Scan(&subID); err != nil {
+		t.Fatal(err)
+	}
+	// локальный ключ с user_token (self-доставка подписки)
+	if _, err := s.db.Exec(`INSERT INTO keys (id, created_at, expires_at, bytes_limit, bytes_used, user_token)
+		VALUES ('loc-key-1', strftime('%s','now'), 0, 1000, 0, 'ut-self')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO subscription_servers (sub_id, server_id, key_id, status) VALUES (?, ?, 'loc-key-1', 'active')`, subID, srvID); err != nil {
+		t.Fatal(err)
+	}
+
+	peek := func(token string, want int) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/v1/peek", nil)
+		req.RemoteAddr = "203.0.113.50:5555"
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("/peek: want %d, got %d: %s", want, w.Code, w.Body.String())
+		}
+		var out map[string]any
+		json.Unmarshal(w.Body.Bytes(), &out)
+		return out
+	}
+	out := peek("ut-self", 200)
+	bundle, _ := out["bundle"].(string)
+	if !strings.HasPrefix(bundle, "vkturn://bundle/") {
+		t.Fatalf("peek bundle = %q", bundle)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(bundle, "vkturn://bundle/"))
+	if err != nil {
+		t.Fatalf("bundle decode: %v", err)
+	}
+	var bp struct {
+		S []struct {
+			Key string `json:"key"`
+		} `json:"s"`
+	}
+	if err := json.Unmarshal(raw, &bp); err != nil || len(bp.S) != 1 || bp.S[0].Key != "loc-key-1" {
+		t.Fatalf("peek bundle payload: %+v err=%v", bp, err)
+	}
+	peek("wrong-token", 404)
 }

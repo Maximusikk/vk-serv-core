@@ -618,7 +618,7 @@ if [ "$NODE_INSTALL" = "1" ] && [ -n "$JOIN_URL" ]; then
                 info "Нода зарегистрирована на мастере $JOIN_URL ✓"
                 printf 'VKTURN_JOIN_STATUS=registered\n'
             elif [ "$JOIN_HTTP_OK" = "1" ] && [ "$JOIN_CODE" = "403" ]; then
-                warn "Мастер отклонил join-токен (403: join token invalid or expired). Токен одноразовый и живёт 1 час — выдай новый на мастере: curl -k -X POST $JOIN_URL/v1/master/join-tokens -H 'X-Admin-Token: <ADMIN_TOKEN мастера>'"
+                warn "Мастер отклонил join-токен (403: join token invalid or expired). Токен одноразовый и живёт 1 час — выдай новый на мастере: curl -k -X POST $JOIN_URL/v1/master/join-tokens -H 'X-Master-Token: <MASTER_TOKEN мастера>'"
             else
                 JOIN_ERR=""
                 [ -s /tmp/vkturn-join.err ] && JOIN_ERR=" (stderr: $(tail -n1 /tmp/vkturn-join.err))"
@@ -655,7 +655,7 @@ if [ "$API_INSTALLED" = "1" ]; then
     fi
     echo -e "${W}Создать ключ:${N} (API — только HTTPS, соединение закрепляется пином)"
     echo "  curl $PIN_FLAG -X POST https://$SERVER_IP:$API_PORT/admin/keys/create \\"
-    echo "    -H 'X-Admin-Token: $ADMIN_TOKEN' \\"
+    echo "    -H 'X-Master-Token: $MASTER_TOKEN' \\"
     echo "    -d '{\"expires_days\":30,\"bytes_limit\":10737418240,\"notes\":\"user1\"}'"
     if [ -n "$TLS_PIN" ] && [ -z "$PIN_B64" ]; then
         echo "  (base64-пин для curl: openssl x509 -in $INSTALL_DIR/tls/api.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)"
@@ -676,7 +676,7 @@ if [ "$IS_MASTER" = "1" ] && [ "$API_INSTALLED" = "1" ]; then
     echo -e "${W}Мастер запущен: https://$SERVER_IP:$API_PORT (режим: $ROLE)${N}"
     echo -e "${W}1. Выдать join-токен для новой ноды:${N}"
     echo "  curl -k -X POST https://$SERVER_IP:$API_PORT/v1/master/join-tokens \\"
-    echo "    -H 'X-Admin-Token: $ADMIN_TOKEN'"
+    echo "    -H 'X-Master-Token: $MASTER_TOKEN'"
     echo "  → {\"token\":\"<hex>\",\"expires_at\":<unix,+1ч>} (одноразовый)"
     echo -e "${W}2. Зарегистрировать ноду (на самой ноде):${N}"
     echo "  JOIN_URL=https://$SERVER_IP:$API_PORT JOIN_TOKEN=<hex> JOIN_PIN=<TLS_PIN мастера> bash install.sh"

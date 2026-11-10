@@ -14,10 +14,11 @@ func TestMasterJoinWithoutAdminToken(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.cfg.Mode = masterMode
 	s.cfg.AdminToken = "adm"
+	s.cfg.MasterToken = "mtk"
 	mux := http.NewServeMux()
 	registerRoutes(mux, s)
 
-	tok := masterCall(t, mux, "POST", "/v1/master/join-tokens", "", 200)["token"].(string)
+	tok := masterCallWithToken(t, mux, "POST", "/v1/master/join-tokens", "", 200, "X-Master-Token", "mtk")["token"].(string)
 	body := `{"token":"` + tok + `","api":"203.0.113.10:7000","pin":"` +
 		strings.Repeat("ab", 32) + `","master_token":"mt","name":"n"}`
 
@@ -37,18 +38,32 @@ func TestMasterJoinWithoutAdminToken(t *testing.T) {
 	}
 }
 
-// Создание join-токена — только с admin-token.
-func TestMasterJoinTokensRequireAdmin(t *testing.T) {
+// Создание join-токена — только с X-Master-Token владельца: админ-токен
+// (он у продавца) join-токены выпускать не должен.
+func TestMasterJoinTokensRequireMaster(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.cfg.Mode = masterMode
 	s.cfg.AdminToken = "adm"
+	s.cfg.MasterToken = "mtk"
 	mux := http.NewServeMux()
 	registerRoutes(mux, s)
-	req := httptest.NewRequest("POST", "/v1/master/join-tokens", nil)
-	req.RemoteAddr = "203.0.113.11:5555"
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("join-tokens без admin-token: want 401, got %d", w.Code)
+	post := func(header, token string) int {
+		req := httptest.NewRequest("POST", "/v1/master/join-tokens", nil)
+		req.RemoteAddr = "203.0.113.11:5555"
+		if header != "" {
+			req.Header.Set(header, token)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+	if code := post("", ""); code != http.StatusUnauthorized {
+		t.Fatalf("join-tokens без токена: want 401, got %d", code)
+	}
+	if code := post("X-Admin-Token", "adm"); code != http.StatusUnauthorized {
+		t.Fatalf("join-tokens с админ-токеном: want 401, got %d", code)
+	}
+	if code := post("X-Master-Token", "mtk"); code != http.StatusOK {
+		t.Fatalf("join-tokens с master-токеном: want 200, got %d", code)
 	}
 }

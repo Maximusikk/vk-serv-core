@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -60,7 +61,10 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	reg("/admin/stats", s.adminMiddleware(s.handleAdminStats))
 
 	// Этап 3: мастер (авторизация — только admin-token мастера). В режиме node отвечают 501.
-	reg("/master/join-tokens", s.adminMiddleware(s.handleMasterJoinTokens))
+	// Опасные операции реестра нод — только с X-Master-Token владельца:
+	// админ-токен (он у продавца) не должен удалять ноды и выпускать join-токены
+	// (join-токен = регистрация постороннего сервера в реестре → утечка ключей).
+	reg("/master/join-tokens", s.masterTokenMiddleware(s.handleMasterJoinTokens))
 	// join вызывает НОВАЯ нода (install.sh JOIN_*): admin-tokenа мастера у неё нет и быть не должно.
 	// Авторизация — одноразовый join-токен (192 бита) + лимит по IP, как у /activate.
 	reg("/master/join", rateLimitMiddleware(s.activateLimiter, s.handleMasterJoin))
@@ -71,17 +75,46 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 			s.handleMasterListSubs(w, r)
 		}
 	}))
-	// DELETE /master/subscriptions/{id} — удалить подписку и её ключи на всех нодах.
+	// Жизненный цикл подписки: DELETE /{id} — удалить на всех нодах;
+	// PATCH /{id} — продление; POST /{id}/add_traffic|revoke|unbind.
 	reg("/master/subscriptions/", s.adminMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
+		p := strings.TrimPrefix(r.URL.Path, "/v1")
+		p = strings.TrimPrefix(p, "/master/subscriptions/")
+		p = strings.TrimSuffix(p, "/")
+		if i := strings.IndexByte(p, '/'); i >= 0 {
+			id, action := p[:i], p[i+1:]
+			if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+				jsonError(w, "subscription id required", http.StatusBadRequest)
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			switch action {
+			case "add_traffic":
+				s.handleMasterAddTrafficSub(w, r)
+			case "revoke":
+				s.handleMasterRevokeSub(w, r)
+			case "unbind":
+				s.handleMasterUnbindSub(w, r)
+			default:
+				jsonError(w, "unknown action", http.StatusNotFound)
+			}
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
 			s.handleMasterDeleteSub(w, r)
-		} else {
+		case http.MethodPatch:
+			s.handleMasterPatchSub(w, r)
+		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	}))
 	reg("/master/servers", s.adminMiddleware(s.handleMasterListServers))
-	// DELETE /master/servers/{id} — удалить ноду из реестра
-	reg("/master/servers/", s.adminMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// DELETE /master/servers/{id} — удалить ноду из реестра (только X-Master-Token)
+	reg("/master/servers/", s.masterTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			s.handleMasterDeleteServer(w, r)
 		} else {
