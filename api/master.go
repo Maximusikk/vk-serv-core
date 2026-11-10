@@ -400,6 +400,7 @@ func (s *Server) masterBundle(sub subRow, servers []subServerRow) string {
 		N     string `json:"n"`
 		S     []srv  `json:"s"`
 		Limit *int64 `json:"limit,omitempty"`
+		M     string `json:"m,omitempty"` // master URL для GET /peek (Android BundleRefresher)
 	}
 	p := payload{V: 1, N: sub.Name}
 	for _, ss := range servers {
@@ -415,6 +416,9 @@ func (s *Server) masterBundle(sub subRow, servers []subServerRow) string {
 	}
 	if sub.BytesLimit > 0 {
 		p.Limit = &sub.BytesLimit
+	}
+	if s.cfg.PublicURL != "" {
+		p.M = s.cfg.PublicURL
 	}
 	raw, err := json.Marshal(p)
 	if err != nil {
