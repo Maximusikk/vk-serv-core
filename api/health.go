@@ -98,9 +98,20 @@ type adminHealth struct {
 	VKLinksOK   int    `json:"vk_links_alive"` // сколько из них отвечают
 	DiskFreeMB  int64  `json:"disk_free_mb"`
 	ActiveUnits int    `json:"active_vkserv"`
+	Ports       *portsHealth `json:"ports,omitempty"` // 1.4: состояния портов (nil, пока reconcile не тикнул)
 	APIVersion  string `json:"api_version"`
 	UptimeSec   int64  `json:"uptime_sec"`
 	TLSPin      string `json:"tls_pin,omitempty"` // SPKI-пин сертификата API (S3, не секрет; пуст до создания сертификата)
+}
+
+// portsHealth — сводка состояний портов (1.2/1.4): active/down/error + время последней проверки.
+type portsHealth struct {
+	Active    int   `json:"active"`
+	Down      int   `json:"down"`
+	Error     int   `json:"error"`
+	Unchecked int   `json:"unchecked"` // порт ещё не проверялся reconcile'ом
+	LastCheck int64 `json:"last_check"` // unix ts самой свежей проверки; 0 = проверок не было
+	DownPorts []int `json:"down_ports,omitempty"`
 }
 
 var processStart = time.Now()
@@ -157,6 +168,28 @@ func (s *Server) handleAdminHealth(w http.ResponseWriter, r *http.Request) {
 	// Живые vkserv@: ключи с выданным портом (истёкшие/отозванные гасятся тикером)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM keys WHERE port IS NOT NULL AND activated_at IS NOT NULL`).
 		Scan(&h.ActiveUnits)
+
+	// 1.4: состояния портов из reconcile-цикла (ports.state)
+	if states, err := (&DB{s.db}).ListPortStates(); err == nil {
+		p := &portsHealth{}
+		for _, ps := range states {
+			switch {
+			case !ps.State.Valid:
+				p.Unchecked++
+			case ps.State.String == PortStateActive:
+				p.Active++
+			case ps.State.String == PortStateDown:
+				p.Down++
+				p.DownPorts = append(p.DownPorts, ps.Port)
+			case ps.State.String == PortStateError:
+				p.Error++
+			}
+			if ps.StateCheckedAt.Valid && ps.StateCheckedAt.Int64 > p.LastCheck {
+				p.LastCheck = ps.StateCheckedAt.Int64
+			}
+		}
+		h.Ports = p
+	}
 
 	h.OK = (h.VKLinkOK || h.VKLinksOK > 0) && h.DiskFreeMB > 100
 	jsonOK(w, h)

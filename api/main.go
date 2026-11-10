@@ -24,6 +24,7 @@ type Config struct {
 	BindAddr       string
 	ListenPort     string
 	AdminToken     string
+	MasterToken    string // 2.4: отдельный токен с доступом только к /admin/keys*, /admin/usage, /admin/health
 	InternalSecret string
 	PortStart      int
 	PortEnd        int
@@ -39,6 +40,14 @@ type Config struct {
 	AdminAllowNets []*net.IPNet // разобранный AdminAllow
 
 	NotifyURL string // webhook продавца для уведомлений (G5); пусто = выключено
+	// 2.5: секрет для подписи вебхуков событий ключа (X-VKTurn-Signature);
+	// пусто = заголовок не отправляется
+	NotifySecret string
+
+	ReconcileInterval time.Duration // период reconcile-цикла портов (1.3); 0 = дефолт 20 с
+
+	Mode     string // этап 3: "node" (по умолчанию) | "master"
+	AlsoNode bool   // этап 3: в режиме master — быть ещё и нодой
 
 	TLSDir string // каталог api.crt/api.key (S1); по умолчанию /opt/vkturn/tls
 	TLSPin string // SPKI-пин сертификата API: hex SHA-256, 64 символа (не секрет)
@@ -56,6 +65,7 @@ func main() {
 	flag.StringVar(&cfg.BindAddr, "bind", "127.0.0.1", "адрес для прослушивания (0.0.0.0 — все интерфейсы)")
 	flag.StringVar(&cfg.ListenPort, "port", "7000", "порт прослушивания")
 	flag.StringVar(&cfg.AdminToken, "admin-token", os.Getenv("ADMIN_TOKEN"), "токен для /admin/*")
+	flag.StringVar(&cfg.MasterToken, "master-token", os.Getenv("MASTER_TOKEN"), "токен только для /admin/keys*, /admin/usage, /admin/health (2.4)")
 	flag.StringVar(&cfg.InternalSecret, "internal-secret", os.Getenv("INTERNAL_SECRET"), "секрет для /internal/*")
 	flag.IntVar(&cfg.PortStart, "port-start", defaultPortStart, "начало диапазона портов vkserv")
 	flag.IntVar(&cfg.PortEnd, "port-end", defaultPortEnd, "конец диапазона портов vkserv")
@@ -72,11 +82,19 @@ func main() {
 	flag.IntVar(&cfg.MaxActive, "max-active", maxActive, "максимум живых портов vkserv (0 = без ограничения)")
 	flag.StringVar(&cfg.AdminAllow, "admin-allow", os.Getenv("ADMIN_ALLOW"), "IP/CIDR через запятую, с которых разрешён /admin/* (пусто = с любого IP)")
 	flag.StringVar(&cfg.NotifyURL, "notify-url", os.Getenv("NOTIFY_URL"), "webhook для уведомлений продавцу: VK-ссылка умерла, диск/порты на исходе (пусто = выключено)")
+	// 2.5: секрет подписи вебхуков событий ключа
+	flag.StringVar(&cfg.NotifySecret, "notify-secret", os.Getenv("NOTIFY_SECRET"), "секрет для подписи вебхуков событий ключа (X-VKTurn-Signature, hex HMAC-SHA256 тела; пусто = без подписи)")
+	// 1.3: период reconcile-цикла; env RECONCILE_INTERVAL (секунды) как альтернатива флагу
+	reconcileSec := envInt("RECONCILE_INTERVAL")
+	flag.DurationVar(&cfg.ReconcileInterval, "reconcile-interval", time.Duration(reconcileSec)*time.Second, "период reconcile-цикла портов (напр. 20s; 0 = дефолт 20s)")
 	tlsDir := os.Getenv("TLS_DIR")
 	if tlsDir == "" {
 		tlsDir = defaultTLSDir
 	}
 	flag.StringVar(&cfg.TLSDir, "tls-dir", tlsDir, "каталог TLS-сертификата API (api.crt/api.key; создаётся при первом старте)")
+	// Этап 3: -mode master — режим админ-сервера; -also-node — быть ещё и нодой
+	flag.StringVar(&cfg.Mode, "mode", "node", "режим: node (по умолчанию) | master")
+	flag.BoolVar(&cfg.AlsoNode, "also-node", false, "в режиме master: быть ещё и нодой (регистрирует себя как ноду)")
 	flag.Parse()
 
 	nets, err := parseAllowList(cfg.AdminAllow)
@@ -114,12 +132,24 @@ func main() {
 
 	srv := NewServer(sqlDB.DB, cfg)
 
+	// Этап 3: в режиме master запускаются циклы мастера и (при -also-node)
+	// собственная нода регистрируется тем же pinned-клиентом, что и чужие.
+	if cfg.Mode == masterMode {
+		go srv.runMasterCycles(context.Background())
+		if cfg.AlsoNode {
+			if err := srv.registerSelfNode(); err != nil {
+				log.Fatalf("master: саморегистрация ноды: %v", err)
+			}
+		}
+	}
+
 	// Шаблон vkserv@ с учётом трафика + iptables после перезагрузки, затем фоновые циклы:
 	// учёт трафика и гашение ключей с истёкшим сроком
 	srv.ensureUserUnits()
 	go srv.runTrafficPoller(context.Background())
 	go srv.runExpiryTicker(context.Background())
 	go srv.runNotifyChecker(context.Background())
+	go srv.runReconciler(context.Background()) // 1.3: сверка портов с реальностью
 
 	mux := http.NewServeMux()
 	registerRoutes(mux, srv)

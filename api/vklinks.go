@@ -202,3 +202,26 @@ func (s *Server) isPrimaryVK(link string) bool {
 	_, _, primary, err := s.readMainConfig()
 	return err == nil && primary != "" && strings.TrimSpace(primary) == link
 }
+
+// vkLinksWithReserve — основная (закреплённая за ключом) ссылка + до двух резервных из пула.
+// Ядро клиента принимает список через запятую (-vk) и раскидывает группы воркеров по ссылкам:
+// смерть одного VK-звонка не роняет туннель, ядро продолжает на оставшихся.
+func (s *Server) vkLinksWithReserve(pinned, fallback string) string {
+	primary := pinned
+	if primary == "" {
+		primary = fallback
+	}
+	if primary == "" {
+		return ""
+	}
+	out := []string{primary}
+	for _, l := range s.vkPool() {
+		if len(out) >= 3 {
+			break
+		}
+		if l != primary {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, ",")
+}

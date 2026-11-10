@@ -36,8 +36,10 @@ CREATE TABLE IF NOT EXISTS keys (
 	activated_at INTEGER,                   -- NULL если не активирован
 	expires_at   INTEGER NOT NULL,          -- unix timestamp
 	bytes_limit  INTEGER NOT NULL DEFAULT 0, -- 0 = безлимит
-	bytes_used   INTEGER NOT NULL DEFAULT 0,
-	port         INTEGER,
+		bytes_used   INTEGER NOT NULL DEFAULT 0,
+		local_limit  INTEGER NOT NULL DEFAULT 0, -- 2.3: локальный стоп на ноде (0 = нет), предохранитель при пропаже мастера
+		limit80_notified INTEGER NOT NULL DEFAULT 0, -- 2.5: key_limit_80 уже отправлен (один раз на ключ)
+		port         INTEGER,
 	user_token   TEXT,
 	wrap_pass    TEXT,
 	notes        TEXT
@@ -45,7 +47,9 @@ CREATE TABLE IF NOT EXISTS keys (
 CREATE TABLE IF NOT EXISTS ports (
 	port    INTEGER PRIMARY KEY,
 	key_id  TEXT,
-	active  INTEGER NOT NULL DEFAULT 1
+	active  INTEGER NOT NULL DEFAULT 1,
+	state   TEXT,                       -- 1.2: active / down / error (NULL = ещё не проверялся)
+	state_checked_at INTEGER            -- 1.2: unix ts последней проверки состояния
 );
 CREATE INDEX IF NOT EXISTS idx_keys_user_token ON keys(user_token);
 CREATE INDEX IF NOT EXISTS idx_keys_port ON keys(port);
@@ -60,6 +64,48 @@ CREATE TABLE IF NOT EXISTS vk_links (
 	link       TEXT PRIMARY KEY,
 	created_at INTEGER NOT NULL
 );
+-- Журнал дельт трафика (2.2): каждая дельта, прибавленная к bytes_used.
+-- Мастер забирает агрегаты по курсору (GET /admin/usage), записи старше 7 дней чистятся.
+CREATE TABLE IF NOT EXISTS usage_log (
+	id     INTEGER PRIMARY KEY AUTOINCREMENT,
+	key_id TEXT    NOT NULL,
+	bytes  INTEGER NOT NULL,
+	ts     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_log_id ON usage_log(id);
+CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
+-- Этап 3: ноды мастера
+CREATE TABLE IF NOT EXISTS servers (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	api          TEXT UNIQUE NOT NULL,
+	pin          TEXT NOT NULL,
+	master_token TEXT NOT NULL,
+	name         TEXT NOT NULL DEFAULT '',
+	status       TEXT NOT NULL DEFAULT 'active',  -- active | down | error
+	last_seen    INTEGER NOT NULL DEFAULT 0,
+	version      TEXT NOT NULL DEFAULT '',
+	capacity     INTEGER NOT NULL DEFAULT 0,
+	since        INTEGER NOT NULL DEFAULT 0       -- курсор usage (3.4)
+);
+-- Этап 3: подписки мастера (один ключ с одним external_id на каждой ноде)
+CREATE TABLE IF NOT EXISTS subscriptions (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	external_id TEXT UNIQUE NOT NULL,
+	name        TEXT NOT NULL DEFAULT '',
+	bytes_limit INTEGER NOT NULL DEFAULT 0,
+	expires_at  INTEGER NOT NULL DEFAULT 0,
+	bytes_used  INTEGER NOT NULL DEFAULT 0,
+	revoked_at  INTEGER
+);
+-- Этап 3: доставка ключа подписки на ноды
+CREATE TABLE IF NOT EXISTS subscription_servers (
+	sub_id    INTEGER NOT NULL,
+	server_id INTEGER NOT NULL,
+	key_id    TEXT NOT NULL DEFAULT '',
+	status    TEXT NOT NULL DEFAULT 'pending',  -- pending | active | failed
+	error     TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (sub_id, server_id)
+);
 `
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -72,6 +118,10 @@ CREATE TABLE IF NOT EXISTS vk_links (
 		`ALTER TABLE keys ADD COLUMN last_unbind_at INTEGER`, // частота unbind (G6)
 		`ALTER TABLE keys ADD COLUMN duration_days INTEGER`,  // C5: срок в днях, отсчёт с первой активации (NULL = не ожидает активации)
 		`ALTER TABLE keys ADD COLUMN vk_link TEXT`,           // VK-звонок, закреплённый за ключом (пул ссылок); NULL = основная
+		`ALTER TABLE ports ADD COLUMN state TEXT`,            // 1.2: active / down / error (NULL = ещё не проверялся)
+		`ALTER TABLE ports ADD COLUMN state_checked_at INTEGER`, // 1.2: unix ts последней проверки
+		`ALTER TABLE keys ADD COLUMN local_limit INTEGER NOT NULL DEFAULT 0`,      // 2.3: локальный стоп на ноде
+		`ALTER TABLE keys ADD COLUMN limit80_notified INTEGER NOT NULL DEFAULT 0`, // 2.5: key_limit_80 отправлен
 	} {
 		if _, err := d.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate %q: %w", stmt, err)
@@ -193,8 +243,51 @@ func (db *DB) AllocatePort(start, end int) (int, error) {
 
 // ReleasePort помечает порт свободным.
 func (db *DB) ReleasePort(port int) error {
-	_, err := db.Exec(`UPDATE ports SET active = 0, key_id = NULL WHERE port = ?`, port)
+	_, err := db.Exec(`UPDATE ports SET active = 0, key_id = NULL, state = NULL, state_checked_at = NULL WHERE port = ?`, port)
 	return err
+}
+
+// Состояния порта (1.2). active — юнит/листенер живы; down — не отвечают;
+// error — состояние проверить не удалось (ошибка systemctl/сокета).
+const (
+	PortStateActive = "active"
+	PortStateDown   = "down"
+	PortStateError  = "error"
+)
+
+// SetPortState фиксирует состояние порта и время проверки (1.2).
+func (db *DB) SetPortState(port int, state string) error {
+	if state != PortStateActive && state != PortStateDown && state != PortStateError {
+		return fmt.Errorf("invalid port state %q", state)
+	}
+	_, err := db.Exec(`UPDATE ports SET state = ?, state_checked_at = strftime('%s','now') WHERE port = ?`, state, port)
+	return err
+}
+
+// PortState — состояние одного порта (1.2).
+type PortState struct {
+	Port          int
+	KeyID         sql.NullString
+	State         sql.NullString
+	StateCheckedAt sql.NullInt64
+}
+
+// ListPortStates возвращает состояния всех активных портов (1.2, для reconcile и /admin/health).
+func (db *DB) ListPortStates() ([]PortState, error) {
+	rows, err := db.Query(`SELECT port, key_id, state, state_checked_at FROM ports WHERE active = 1 ORDER BY port`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PortState
+	for rows.Next() {
+		var ps PortState
+		if err := rows.Scan(&ps.Port, &ps.KeyID, &ps.State, &ps.StateCheckedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, ps)
+	}
+	return out, rows.Err()
 }
 
 func nullInt(v sql.NullInt64) int64 {

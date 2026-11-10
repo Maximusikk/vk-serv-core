@@ -52,15 +52,19 @@ func (s *Server) handleInternalTraffic(w http.ResponseWriter, r *http.Request) {
 }
 
 // deactivatePort останавливает vkserv на порту и закрывает iptables правило.
-// Под сериализацией provisionMu (V3): порт может переиспользоваться следующим
-// владельцем сразу после UPDATE ports/keys — без мьютекса гашение старого порта
-// способно задеть живой vkserv нового юзера, а его трафик — попасть чужому.
-// deactivatePort не вызывается из кода, уже держащего provisionMu
-// (provisionPort при откате делает очистку инлайн) — дедлока нет.
+// Берёт provisionMu и вызывает deactivatePortLocked — вызывать, когда ключ уже
+// проверен (revoke/expiry/лимит по своим путям).
 func (s *Server) deactivatePort(port int, reason string) {
 	s.provisionMu.Lock()
 	defer s.provisionMu.Unlock()
+	s.deactivatePortLocked(port, reason)
+}
 
+// deactivatePortLocked — тело гашения порта. ВЫЗЫВАТЬ ТОЛЬКО ДЕРЖА provisionMu
+// (см. deactivatePortForLimit и reconcile.restartPortService): порт может
+// переиспользоваться следующим владельцем сразу после UPDATE ports/keys —
+// без мьютекса гашение старого порта способно задеть живой vkserv нового юзера.
+func (s *Server) deactivatePortLocked(port int, reason string) {
 	unit := fmt.Sprintf("vkserv@%d", port)
 
 	// Останавливаем и отключаем systemd юнит

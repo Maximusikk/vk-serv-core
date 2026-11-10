@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -111,7 +112,8 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		res, err := s.db.Exec(`UPDATE keys SET device_id = ?
 			WHERE id = ? AND (device_id IS NULL OR device_id = '')`, req.DeviceID, req.Key)
 		if err != nil {
-			jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("[activate] ключ %s: device bind: %v", req.Key, err)
+			jsonError(w, "Внутренняя ошибка сервера — попробуй ещё раз", http.StatusInternalServerError)
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -124,14 +126,18 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Ссылка на VK-звонок: закреплена за ключом, новым ключам достаётся наименее загруженная
+	// Ссылка на VK-звонок: закреплена за ключом, новым ключам достаётся наименее загруженная.
+	// В конфиг уходит основная + до двух резервных из пула (ядро клиента раскидывает
+	// группы воркеров по ссылкам — смерть одного звонка не роняет туннель).
 	vkLink := s.assignVKLink(req.Key, fallbackVK)
+	vkField := s.vkLinksWithReserve(vkLink, fallbackVK)
 
 	// Уже активирован — отдаём конфиг повторно (переактивация тем же устройством)
 	if activatedAt != nil && existingPort != nil && existingToken != nil {
-		config, err := s.buildVkturnLink(req.Key, *existingPort, vkLink)
+		config, err := s.buildVkturnLink(req.Key, *existingPort, vkField)
 		if err != nil {
-			jsonError(w, "failed to build config: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("[activate] ключ %s: rebuild config: %v", req.Key, err)
+			jsonError(w, "Не удалось собрать конфиг — попробуй ещё раз", http.StatusInternalServerError)
 			return
 		}
 		jsonOK(w, activateResponse{
@@ -149,7 +155,8 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		var active int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM keys
 			WHERE port IS NOT NULL AND activated_at IS NOT NULL`).Scan(&active); err != nil {
-			jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("[activate] ключ %s: max-active count: %v", req.Key, err)
+			jsonError(w, "Внутренняя ошибка сервера — попробуй ещё раз", http.StatusInternalServerError)
 			return
 		}
 		if active >= s.cfg.MaxActive {
@@ -159,10 +166,13 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	}
 	prov, err := s.provisionPort(req.Key, false)
 	if err != nil {
+		// Детали ошибки (systemctl, пути, внутренности provision) — только в лог
+		// сервера; пользователь получает читаемый текст без внутренностей (G2).
+		log.Printf("[activate] ключ %s: provisionPort: %v", req.Key, err)
 		if strings.Contains(err.Error(), "no free ports") {
-			jsonError(w, err.Error(), http.StatusServiceUnavailable)
+			jsonErrorCode(w, "Сервер заполнен — обратись к продавцу, это временно", "server_full", http.StatusServiceUnavailable)
 		} else {
-			jsonError(w, err.Error(), http.StatusInternalServerError)
+			jsonErrorCode(w, "Не удалось выдать порт — попробуй ещё раз через минуту", "provision_failed", http.StatusInternalServerError)
 		}
 		return
 	}
@@ -171,12 +181,13 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 
 	hy2Pass, serverIP, _, err := s.readMainConfig()
 	if err != nil {
-		jsonError(w, "server config error: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("[activate] ключ %s: readMainConfig: %v", req.Key, err)
+		jsonErrorCode(w, "Ошибка конфигурации сервера — обратись к продавцу", "server_config", http.StatusInternalServerError)
 		return
 	}
 
 	// ── Генерируем vkturn:// ─────────────────────────────────────────────────
-	config, err := buildVkturnLinkRaw(serverIP, prov.Port, vkLink, prov.WrapPass, hy2Pass, s.cfg.TLSPin)
+	config, err := buildVkturnLinkRaw(serverIP, prov.Port, vkField, prov.WrapPass, hy2Pass, s.cfg.TLSPin)
 	if err != nil {
 		jsonError(w, "failed to build config", http.StatusInternalServerError)
 		return
@@ -188,6 +199,11 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:  expiresAt,
 		BytesLimit: bytesLimit,
 	})
+
+	// 2.5: ключ успешно активирован, порт выдан — уведомляем продавца.
+	var extID string
+	_ = s.db.QueryRow(`SELECT IFNULL(external_id,'') FROM keys WHERE id = ?`, req.Key).Scan(&extID)
+	s.notifyKeyEvent("key_activated", req.Key, extID, prov.Port)
 }
 
 // ── Выдача порта ──────────────────────────────────────────────────────────────
