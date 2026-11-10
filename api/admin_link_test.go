@@ -37,6 +37,36 @@ func TestBuildUserKeyLinkNoSchemeAdded(t *testing.T) {
 	}
 }
 
+// PUBLIC_URL со схемой — в vkturn://key/<host> уходит только authority
+// (баг продакшна: PUBLIC_URL=http://… давал link "vkturn://key/http://…/…").
+func TestBuildUserKeyLinkStripsScheme(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.cfg.TLSPin = "ab12"
+	for _, pub := range []string{"https://203.0.113.9:7000", "http://203.0.113.9:7000", "203.0.113.9:7000"} {
+		s.cfg.PublicURL = pub
+		link := s.buildUserKeyLink("k")
+		want := "vkturn://key/203.0.113.9:7000/k?pin=ab12"
+		if link != want {
+			t.Fatalf("PublicURL %q: link = %q, want %q", pub, link, want)
+		}
+	}
+}
+
+// fullPublicURL: без схемы добавляется https:// (m-поле bundle для GET /peek).
+func TestFullPublicURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                        "",
+		"203.0.113.9:7000":        "https://203.0.113.9:7000",
+		"https://example.com:7000": "https://example.com:7000",
+		"http://example.com":      "http://example.com",
+		"  example.com:7000  ":    "https://example.com:7000",
+	} {
+		if got := fullPublicURL(in); got != want {
+			t.Fatalf("fullPublicURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // Без пина (TLSPin пуст) ссылка прежнего вида, без параметра pin.
 func TestBuildUserKeyLinkNoPin(t *testing.T) {
 	s, _ := newTestServer(t)

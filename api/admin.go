@@ -147,16 +147,20 @@ type createKeyResponse struct {
 }
 
 // existingKeyResponse — ответ на повторный create с тем же external_id (C1).
-func (s *Server) existingKeyResponse(key string) createKeyResponse {
+func (s *Server) existingKeyResponse(key string) (createKeyResponse, error) {
 	var expiresAt, durationDays int64
-	_ = s.db.QueryRow(`SELECT expires_at, COALESCE(duration_days, 0) FROM keys WHERE id = ?`, key).
-		Scan(&expiresAt, &durationDays)
+	if err := s.db.QueryRow(`SELECT expires_at, COALESCE(duration_days, 0) FROM keys WHERE id = ?`, key).
+		Scan(&expiresAt, &durationDays); err != nil {
+		// Игнорировать ошибку = отдать expires_at=0 («бессрочно») для существующего
+		// ключа при гонке с DELETE. Честная ошибка лучше вранья в ответе.
+		return createKeyResponse{}, err
+	}
 	resp := createKeyResponse{Key: key, ExpiresAt: expiresAt, DurationDays: durationDays,
 		Link: s.buildUserKeyLink(key), Duplicate: true}
 	if durationDays > 0 {
 		resp.Start = startOnActivation
 	}
-	return resp
+	return resp, nil
 }
 
 func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +180,12 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		var key string
 		err := s.db.QueryRow(`SELECT id FROM keys WHERE external_id = ?`, req.ExternalID).Scan(&key)
 		if err == nil {
-			jsonOK(w, s.existingKeyResponse(key))
+			resp, err := s.existingKeyResponse(key)
+			if err != nil {
+				jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			jsonOK(w, resp)
 			return
 		}
 	}
@@ -235,7 +244,12 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(err.Error(), "UNIQUE") && req.ExternalID != "" {
 			var existing string
 			if s.db.QueryRow(`SELECT id FROM keys WHERE external_id = ?`, req.ExternalID).Scan(&existing) == nil {
-				jsonOK(w, s.existingKeyResponse(existing))
+				resp, err := s.existingKeyResponse(existing)
+				if err != nil {
+					jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				jsonOK(w, resp)
 				return
 			}
 		}
@@ -251,11 +265,19 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 
 // buildUserKeyLink (C2) — готовая ссылка vkturn://key/<host>/<KEY>?pin=<TLSPin>.
 // Публичный адрес: флаг -public-url / переменная PUBLIC_URL, иначе bind-адрес по факту.
+// Схема и путь из PUBLIC_URL отбрасываются: в authority идёт только host:port
+// (PUBLIC_URL может задаваться и как "https://host:7000" — для поля m в bundle).
 // Пин (S3) добавляется параметром ?pin=, чтобы приложение проверило SPKI-пин сервера
 // до отправки ключа (контракт §1). Пин не секрет; если TLSPin пуст (сертификат не
 // создан — в норме не бывает после S1), ссылка строится без pin.
 func (s *Server) buildUserKeyLink(key string) string {
 	host := s.cfg.PublicURL
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
+	}
 	if host == "" {
 		host = "127.0.0.1:7000" // локальный фоллбэк; на сервере задаётся PUBLIC_URL
 	}

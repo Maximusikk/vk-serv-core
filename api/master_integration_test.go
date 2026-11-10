@@ -44,6 +44,7 @@ type fakeNode struct {
 	crBodies []map[string]any // тела keys/create
 	patches  map[string][]map[string]any // key_id -> тела PATCH (extend/traffic)
 	revoked  map[string]bool
+	revokes  map[string]int // key_id -> сколько раз получен /revoke
 	unbound  map[string]bool
 	unbind429 map[string]bool // key_id -> отвечать 429 (7-дневный лимит)
 	usage []fakeUsage
@@ -62,6 +63,7 @@ func startFakeNode(t *testing.T, name string) *fakeNode {
 		cert: cert,
 		keys: map[string]string{}, revoked: map[string]bool{},
 		patches:   map[string][]map[string]any{},
+		revokes:   map[string]int{},
 		unbound:   map[string]bool{},
 		unbind429: map[string]bool{},
 	}
@@ -121,6 +123,12 @@ func (n *fakeNode) isRevoked(keyID string) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.revoked[keyID]
+}
+
+func (n *fakeNode) revokeCount(keyID string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.revokes[keyID]
 }
 
 func (n *fakeNode) createBody(extID string) map[string]any {
@@ -192,6 +200,7 @@ func (n *fakeNode) mux() http.Handler {
 			key := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/admin/keys/"), "/revoke")
 			n.mu.Lock()
 			n.revoked[key] = true
+			n.revokes[key]++
 			n.mu.Unlock()
 			jsonOK(w, map[string]any{"ok": true})
 		case strings.HasSuffix(p, "/unbind"):
@@ -558,8 +567,11 @@ func TestMasterEndToEnd(t *testing.T) {
 		t.Fatalf("order-9: delivered = %v, хочу 2", out9["delivered"])
 	}
 
-	// healthTick: реальный dialPinned отвергает сертификат → нода 3 down.
-	s.healthTick()
+	// healthTick: реальный dialPinned отвергает сертификат → нода 3 down
+	// после healthDownFails подряд неудач (гистерезис).
+	for i := 0; i < healthDownFails; i++ {
+		s.healthTick()
+	}
 	svList := masterCall(t, mux, "GET", "/v1/master/servers", "", 200)["servers"].([]any)
 	for _, v := range svList {
 		m := v.(map[string]any)
@@ -576,6 +588,7 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	s.cfg.Mode = masterMode
 	s.cfg.AdminToken = "adm"
 	s.cfg.MasterToken = "mtk"
+	s.cfg.PublicURL = "PLACEHOLDER" // подменяется на addr ноды после join
 	mux := http.NewServeMux()
 	registerRoutes(mux, s)
 
@@ -591,12 +604,26 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	}
 	join(node1, "mt-1")
 	join(node2, "mt-2")
+	s.cfg.PublicURL = node1.addr // bare host:port — код сам добавит https:// в m-поле
 
 	out := masterCall(t, mux, "POST", "/v1/master/subscriptions",
 		`{"external_id":"lc-1","name":"LC","bytes_limit":1000,"expires_days":30}`, 200)
 	subID := int64(out["id"].(float64))
 	if got := int(out["delivered"].(float64)); got != 2 {
 		t.Fatalf("delivered = %d, хочу 2", got)
+	}
+
+	// m-поле bundle: PUBLIC_URL без схемы → https:// (клиент делает GET /peek).
+	bundleLC, _ := out["bundle"].(string)
+	rawLC, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(bundleLC, "vkturn://bundle/"))
+	if err != nil {
+		t.Fatalf("bundle decode: %v", err)
+	}
+	var bpLC struct {
+		M string `json:"m"`
+	}
+	if err := json.Unmarshal(rawLC, &bpLC); err != nil || bpLC.M != "https://"+node1.addr {
+		t.Fatalf("bundle m = %q (err=%v), хочу %q", bpLC.M, err, "https://"+node1.addr)
 	}
 
 	// ── Продление: fan-out PATCH {expires_days} на обе ноды ─────────────────────
@@ -662,6 +689,12 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	out = masterCall(t, mux, "POST", fmt.Sprintf("/v1/master/subscriptions/%d/revoke", subID), "", 200)
 	if v, _ := out["already_revoked"].(bool); !v {
 		t.Fatalf("повторный revoke: хочу already_revoked, got %v", out)
+	}
+	// already_revoked НЕ короткое замыкание: revoke повторно уходит на ноды
+	// (первый раз нода могла быть недоступна). Нодовый revoke идемпотентен.
+	if node1.revokeCount(node1.keyFor("lc-1")) != 2 || node2.revokeCount(node2.keyFor("lc-1")) != 2 {
+		t.Fatalf("повторный revoke не дошёл до нод: n1=%d n2=%d, хочу по 2",
+			node1.revokeCount(node1.keyFor("lc-1")), node2.revokeCount(node2.keyFor("lc-1")))
 	}
 
 	// ── Unbind: 200 на ноде 1, 429 на ноде 2 → частичный успех в results ────────

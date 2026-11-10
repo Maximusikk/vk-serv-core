@@ -22,6 +22,10 @@ const (
 	trafficPeriod  = 60 * time.Second
 	healthInterval = 30 * time.Second
 	usagePageSize  = 1000
+
+	// healthDownFails — сколько ПОДРЯД неудачных probe переводят ноду в down
+	// (гистерезис против флаппинга active↔down на сетевой диспетчине).
+	healthDownFails = 3
 )
 
 // runMasterCycles — три тикера мастера. В не-master режиме ничего не делает.
@@ -241,7 +245,9 @@ type usageItemResp struct {
 }
 
 // collectNodeUsage вычитывает все страницы usage ноды и прибавляет дельты к
-// subscriptions.bytes_used. Курсор ноды двигается только при полном успехе.
+// subscriptions.bytes_used. Дельты страницы и курсор коммитятся ОДНОЙ транзакцией:
+// сбой на середине страницы откатывает всё — следующий тик перечитает окно с
+// последнего закоммиченного курсора БЕЗ дублей в bytes_used.
 func (s *Server) collectNodeUsage(n nodeRow) {
 	cursor := n.Since
 	for page := 0; ; page++ {
@@ -255,32 +261,46 @@ func (s *Server) collectNodeUsage(n nodeRow) {
 			log.Printf("[master:traffic] нода %s: %v", n.API, err)
 			return
 		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			log.Printf("[master:traffic] нода %s: tx: %v", n.API, err)
+			return
+		}
 		for _, it := range resp.Items {
 			if it.KeyID == "" || it.Bytes == 0 {
 				continue
 			}
-			if _, err := s.db.Exec(`
+			if _, err := tx.Exec(`
 				UPDATE subscriptions SET bytes_used = bytes_used + ?
 				WHERE id = (SELECT sub_id FROM subscription_servers WHERE key_id = ?)`,
 				it.Bytes, it.KeyID); err != nil {
+				tx.Rollback()
 				log.Printf("[master:traffic] дельта key %s: %v", it.KeyID, err)
 				return // счётчик недостоверен — курсор не двигаем
 			}
 		}
+		newCursor := cursor
 		if resp.Next > cursor {
-			cursor = resp.Next
+			newCursor = resp.Next
 		}
+		if newCursor != n.Since {
+			if _, err := tx.Exec(`UPDATE servers SET since = ? WHERE id = ?`, newCursor, n.ID); err != nil {
+				tx.Rollback()
+				log.Printf("[master:traffic] курсор ноды %s: %v", n.API, err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			log.Printf("[master:traffic] нода %s: commit: %v", n.API, err)
+			return
+		}
+		cursor = newCursor
 		if len(resp.Items) < usagePageSize {
 			break // страница неполная — вычитали всё
 		}
 		if page > 1000 { // страховка от бесконечного цикла
 			log.Printf("[master:traffic] нода %s: слишком много страниц, курсор на %d", n.API, cursor)
 			break
-		}
-	}
-	if cursor != n.Since {
-		if _, err := s.db.Exec(`UPDATE servers SET since = ? WHERE id = ?`, cursor, n.ID); err != nil {
-			log.Printf("[master:traffic] курсор ноды %s: %v", n.API, err)
 		}
 	}
 }
@@ -347,14 +367,25 @@ func (s *Server) healthTick() {
 		err := s.nodeCall(n, http.MethodGet, "/v1/admin/health", nil, &h)
 		now := time.Now().Unix()
 		if err == nil {
+			delete(s.healthFails, n.ID)
 			s.db.Exec(`UPDATE servers SET status = 'active', last_seen = ? WHERE id = ?`, now, n.ID)
-		} else {
-			s.db.Exec(`UPDATE servers SET status = 'down' WHERE id = ?`, n.ID)
+			if n.Status == "down" {
+				s.sendNodeWebhook("node_up", n.API, "")
+			}
+			continue
 		}
-		if n.Status == "active" && err != nil {
+		// Гистерезис: одна сетевая диспетчина не роняет ноду — иначе флаппинг
+		// active↔down давал бы спам вебхуков и пропуски fan-out операций
+		// (fanoutSubOp/dispatch пропускают ноды со статусом != active).
+		fails := s.healthFails[n.ID] + 1
+		s.healthFails[n.ID] = fails
+		if fails < healthDownFails {
+			log.Printf("[master:health] нода %s: %v (неудача %d/%d)", n.API, err, fails, healthDownFails)
+			continue
+		}
+		s.db.Exec(`UPDATE servers SET status = 'down' WHERE id = ?`, n.ID)
+		if n.Status == "active" {
 			s.sendNodeWebhook("node_down", n.API, err.Error())
-		} else if n.Status == "down" && err == nil {
-			s.sendNodeWebhook("node_up", n.API, "")
 		}
 	}
 }

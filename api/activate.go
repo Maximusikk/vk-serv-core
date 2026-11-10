@@ -66,7 +66,7 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 
 	// ── Найти ключ в БД ───────────────────────────────────────────────────────
 	row := s.db.QueryRow(`
-		SELECT id, activated_at, expires_at, bytes_limit, bytes_used, port, user_token, device_id, revoked_at
+		SELECT id, activated_at, expires_at, bytes_limit, bytes_used, local_limit, port, user_token, device_id, revoked_at
 		FROM keys WHERE id = ?`, req.Key)
 
 	var (
@@ -75,12 +75,13 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		expiresAt     int64
 		bytesLimit    int64
 		bytesUsed     int64
+		localLimit    int64
 		existingPort  *int
 		existingToken *string
 		boundDevice   *string
 		revokedAt     *int64
 	)
-	if err := row.Scan(&id, &activatedAt, &expiresAt, &bytesLimit, &bytesUsed, &existingPort, &existingToken, &boundDevice, &revokedAt); err != nil {
+	if err := row.Scan(&id, &activatedAt, &expiresAt, &bytesLimit, &bytesUsed, &localLimit, &existingPort, &existingToken, &boundDevice, &revokedAt); err != nil {
 		jsonErrorCode(w, "Ключ не найден", "key_not_found", http.StatusNotFound)
 		return
 	}
@@ -96,8 +97,10 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		jsonErrorCode(w, "Срок действия ключа истёк", "expired", http.StatusForbidden)
 		return
 	}
-	// Лимит трафика: иначе после отключения по лимиту ключ активировался бы заново
-	if bytesLimit > 0 && bytesUsed >= bytesLimit {
+	// Лимит трафика: иначе после отключения по лимиту ключ активировался бы заново.
+	// local_limit — нодовый стоп-кран подписок: тоже честно проверяем (мастер мог
+	// поднять только bytes_limit, а исчерпанный local_limit остался).
+	if (bytesLimit > 0 && bytesUsed >= bytesLimit) || (localLimit > 0 && bytesUsed >= localLimit) {
 		jsonErrorCode(w, "Лимит трафика по ключу исчерпан", "limit_exhausted", http.StatusForbidden)
 		return
 	}
@@ -227,10 +230,14 @@ func (s *Server) provisionPort(keyID string, keepToken bool) (*provisionResult, 
 	// Повторная проверка под мьютексом: два одновременных запроса одного ключа
 	// (двойной тап, ретрай клиента, /activate + PATCH) не должны выдать ему два порта —
 	// первый vkserv@ остался бы работать «сиротой» без учёта и без гашения.
+	// revoked_at IS NULL: гонка «PATCH продления запустил reprovision ↔ revoke
+	// успел отозвать» — отозванному ключу порт не поднимаем.
 	var curPort *int
 	var curWrap, curToken *string
-	if err := s.db.QueryRow(`SELECT port, wrap_pass, user_token FROM keys WHERE id = ?`, keyID).
-		Scan(&curPort, &curWrap, &curToken); err == nil &&
+	var curRevoked *int64
+	if err := s.db.QueryRow(`SELECT port, wrap_pass, user_token, revoked_at FROM keys WHERE id = ?`, keyID).
+		Scan(&curPort, &curWrap, &curToken, &curRevoked); err == nil &&
+		curRevoked == nil &&
 		curPort != nil && curWrap != nil && *curWrap != "" && curToken != nil && *curToken != "" {
 		return &provisionResult{Port: *curPort, WrapPass: *curWrap, UserToken: *curToken}, nil
 	}
@@ -312,13 +319,16 @@ func (s *Server) provisionPort(keyID string, keepToken bool) (*provisionResult, 
 func (s *Server) allocatePort() (int, error) {
 	var usedPorts = make(map[int]bool)
 	rows, err := s.db.Query(`SELECT port FROM ports WHERE active = 1 AND port IS NOT NULL`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var p int
-			if rows.Scan(&p) == nil {
-				usedPorts[p] = true
-			}
+	if err != nil {
+		// Молча пропустить ошибку = выдать PortStart занятому порту (два юзера
+		// на одном vkserv). Честная ошибка лучше коллизии.
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p int
+		if rows.Scan(&p) == nil {
+			usedPorts[p] = true
 		}
 	}
 	for p := s.cfg.PortStart; p <= s.cfg.PortEnd; p++ {

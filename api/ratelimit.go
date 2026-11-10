@@ -101,6 +101,8 @@ const (
 	activateRateWin   = time.Minute
 	adminRateLimit    = 10
 	adminRateWin      = time.Minute
+	statusRateLimit   = 120 // /status и /peek: дешёвый флуд сюда упирается в
+	statusRateWin     = time.Minute // единственное DB-соединение (MaxOpenConns(1))
 )
 
 // activateRate — лимит /activate с учётом флага -activate-rate (0 и меньше = без лимита).

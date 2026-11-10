@@ -259,6 +259,12 @@ func (s *Server) handleMasterCreateSub(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "external_id and expires_days are required", http.StatusBadRequest)
 		return
 	}
+	if req.ExpiresDays > maxExpiresDays {
+		// Иначе все ноды вернут 400 и подписка зависнет в pending навсегда
+		// (restoreExpiresDays требует хоть одну active-доставку).
+		jsonError(w, "expires_days too large (max 3650)", http.StatusBadRequest)
+		return
+	}
 	if req.BytesLimit < 0 {
 		jsonError(w, "bytes_limit must be >= 0", http.StatusBadRequest)
 		return
@@ -306,12 +312,26 @@ func (s *Server) dispatchSubscription(subID int64, bytesLimit, expiresDays int64
 			ON CONFLICT(sub_id, server_id) DO NOTHING`, subID, n.ID)
 	}
 
-	delivered := 0
-	for _, n := range nodes {
-		var st, keyID, errText string
+	// create к нодам — параллельно (как fanoutSubOp): недоступная нода держит
+	// свой 12с-таймаут, последовательный обход растянул бы create на N×12с.
+	type dispatchResult struct {
+		st     string
+		keyID  string
+		errTxt string
+	}
+	res := make([]dispatchResult, len(nodes))
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex
+	)
+	for i, n := range nodes {
 		if n.Status != "active" {
-			st, errText = subPending, ""
-		} else {
+			res[i] = dispatchResult{st: subPending}
+			continue
+		}
+		wg.Add(1)
+		go func(i int, n nodeRow) {
+			defer wg.Done()
 			var resp struct {
 				Key string `json:"key"`
 			}
@@ -322,22 +342,33 @@ func (s *Server) dispatchSubscription(subID int64, bytesLimit, expiresDays int64
 				"local_limit":  bytesLimit, // 3.3: страховка на ноде, если мастер пропал
 				"external_id":  sub.ExternalID,
 			}, &resp)
+			var r dispatchResult
 			switch {
 			case err == nil && resp.Key != "":
-				st, keyID = subActive, resp.Key
-				delivered++
+				r = dispatchResult{st: subActive, keyID: resp.Key}
 			case err == nil:
-				st, errText = subFailed, "нода вернула пустой key"
+				r = dispatchResult{st: subFailed, errTxt: "нода вернула пустой key"}
 			default:
-				st, errText = subFailed, err.Error()
+				r = dispatchResult{st: subFailed, errTxt: err.Error()}
 			}
+			mu.Lock()
+			res[i] = r
+			mu.Unlock()
+		}(i, n)
+	}
+	wg.Wait()
+
+	delivered := 0
+	for i, n := range nodes {
+		if res[i].st == subActive {
+			delivered++
 		}
 		if _, err := s.db.Exec(`
 			INSERT INTO subscription_servers (sub_id, server_id, key_id, status, error)
 			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT(sub_id, server_id) DO UPDATE SET key_id = excluded.key_id,
 				status = excluded.status, error = excluded.error`,
-			subID, n.ID, keyID, st, errText); err != nil {
+			subID, n.ID, res[i].keyID, res[i].st, res[i].errTxt); err != nil {
 			log.Printf("[master] подписка %d: статус ноды %s: %v", subID, n.API, err)
 		}
 	}
@@ -418,13 +449,27 @@ func (s *Server) masterBundle(sub subRow, servers []subServerRow) string {
 		p.Limit = &sub.BytesLimit
 	}
 	if s.cfg.PublicURL != "" {
-		p.M = s.cfg.PublicURL
+		p.M = fullPublicURL(s.cfg.PublicURL)
 	}
 	raw, err := json.Marshal(p)
 	if err != nil {
 		return ""
 	}
 	return "vkturn://bundle/" + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// fullPublicURL — PUBLIC_URL с гарантированной схемой (для поля m в bundle:
+// клиент делает GET https://<m>/peek). Без схемы в конфиге добавляем https:// —
+// API всегда терминирует TLS, http:// на 7000 отвечает ошибкой.
+func fullPublicURL(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	return u
 }
 
 func (s *Server) subscriptionResponse(subID int64, delivered int) map[string]any {
@@ -763,6 +808,8 @@ type subOpResult struct {
 
 // fanoutSubOp применяет op к каждой доставке подписки со статусом active:
 // pending/failed (ключа ещё нет) и недоступные ноды пропускаются.
+// Ноды обходятся ПАРАЛЛЕЛЬНО: последовательный fan-out при недоступных нодах
+// упирается в 12с-таймаут nodeCall на каждую (N нод = N×12с внутри HTTP-хендлера).
 // Возвращает results и число успешных нод.
 func (s *Server) fanoutSubOp(subID int64, op func(n nodeRow, ss subServerRow) error) ([]subOpResult, int) {
 	servers, _ := s.subServers(subID)
@@ -771,24 +818,40 @@ func (s *Server) fanoutSubOp(subID int64, op func(n nodeRow, ss subServerRow) er
 	for _, n := range nodes {
 		byID[n.ID] = n
 	}
-	results := make([]subOpResult, 0, len(servers))
-	okN := 0
-	for _, ss := range servers {
-		res := subOpResult{API: ss.API, KeyID: ss.KeyID, Status: "skipped"}
-		if ss.Status == subActive && ss.KeyID != "" {
-			if n, found := byID[ss.ServerID]; found && n.Status == "active" {
-				if err := op(n, ss); err != nil {
-					res.Status, res.Error = "failed", err.Error()
-				} else {
-					res.Status = "ok"
-					okN++
-				}
-			} else {
-				res.Status, res.Error = "failed", "нода недоступна"
-			}
+	results := make([]subOpResult, len(servers))
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		okN  int
+	)
+	for i, ss := range servers {
+		results[i] = subOpResult{API: ss.API, KeyID: ss.KeyID, Status: "skipped"}
+		if ss.Status != subActive || ss.KeyID == "" {
+			continue
 		}
-		results = append(results, res)
+		n, found := byID[ss.ServerID]
+		if !found || n.Status != "active" {
+			results[i] = subOpResult{API: ss.API, KeyID: ss.KeyID, Status: "failed", Error: "нода недоступна"}
+			continue
+		}
+		wg.Add(1)
+		go func(i int, n nodeRow, ss subServerRow) {
+			defer wg.Done()
+			res := subOpResult{API: ss.API, KeyID: ss.KeyID}
+			if err := op(n, ss); err != nil {
+				res.Status, res.Error = "failed", err.Error()
+			} else {
+				res.Status = "ok"
+			}
+			mu.Lock()
+			results[i] = res
+			if res.Status == "ok" {
+				okN++
+			}
+			mu.Unlock()
+		}(i, n, ss)
 	}
+	wg.Wait()
 	return results, okN
 }
 
@@ -937,9 +1000,18 @@ func (s *Server) handleMasterRevokeSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sub.RevokedAt.Valid {
-		resp := s.subscriptionResponse(id, 0)
+		// Уже отозвана. НЕ короткое замыкание: при первом revoke нода могла быть
+		// недоступна и ключи на ней живы — fan-out повторяем (revoke на ноде
+		// идемпотентен, revoked_at там COALESCE).
+		results, okN := s.fanoutSubOp(id, func(n nodeRow, ss subServerRow) error {
+			return s.nodeCall(n, http.MethodPost, "/v1/admin/keys/"+ss.KeyID+"/revoke", nil, nil)
+		})
+		log.Printf("[master] подписка %d (%s): re-revoke по нодам, ok %d/%d", id, sub.ExternalID, okN, len(results))
+		resp := s.subscriptionResponse(id, okN)
 		resp["status"] = "revoked"
 		resp["already_revoked"] = true
+		resp["revoked_at"] = sub.RevokedAt.Int64
+		resp["results"] = results
 		jsonOK(w, resp)
 		return
 	}
