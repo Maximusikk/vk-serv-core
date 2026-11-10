@@ -21,6 +21,8 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	// Публичные (/activate ограничен по IP — B5)
 	reg("/activate", rateLimitMiddleware(s.activateLimiter, s.handleActivate))
 	reg("/status", s.handleStatus)
+	// Peek: свежий bundle для клиента (master-mode, auth — user_token)
+	reg("/peek", s.handleMasterPeek)
 
 	// Админские (за проверкой X-Admin-Token)
 	reg("/admin/keys/create", s.adminMiddleware(s.handleAdminCreateKey))

@@ -565,6 +565,46 @@ func parsePinHex(v string) string {
 // Best-effort: пытается удалить ключи всех подписок на этой ноде (если она доступна),
 // затем убирает запись сервера и все subscription_servers для него.
 // Если нода недоступна — ключи на ней останутся, но мастер про неё забудет.
+// handleMasterPeek — GET /v1/peek
+// Публичный (только user_token), режим мастера.
+// Возвращает свежий bundle подписки, к которой привязан токен.
+// Клиент вызывает при старте: если bundle изменился (ноды добавлены/удалены) —
+// переактивирует группу и обновляет список серверов.
+func (s *Server) handleMasterPeek(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) { return }
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := bearerToken(r)
+	if token == "" {
+		jsonError(w, "authorization required", http.StatusUnauthorized)
+		return
+	}
+	// Находим подписку по user_token любой ноды в subscription_servers
+	var subID int64
+	err := s.db.QueryRow(`
+		SELECT ss.subscription_id
+		FROM subscription_servers ss
+		JOIN keys k ON k.id = ss.key_id
+		WHERE k.user_token = ?
+		LIMIT 1`, token).Scan(&subID)
+	if err != nil {
+		jsonError(w, "subscription not found", http.StatusNotFound)
+		return
+	}
+	resp := s.subscriptionResponse(subID, 0)
+	bundle, _ := resp["bundle"].(string)
+	if bundle == "" {
+		jsonError(w, "bundle not available", http.StatusServiceUnavailable)
+		return
+	}
+	jsonOK(w, map[string]any{
+		"bundle": bundle,
+		"sub_id": subID,
+	})
+}
+
 func (s *Server) handleMasterDeleteServer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w) {
 		return
