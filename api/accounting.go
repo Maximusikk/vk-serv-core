@@ -44,6 +44,11 @@ func (s *Server) runTrafficPoller(ctx context.Context) {
 			} else if n > 0 {
 				log.Printf("[usage] чистка usage_log: удалено %d записей старше 7 дней", n)
 			}
+			if n, err := s.cleanReports(reportRetention); err != nil {
+				log.Printf("[report] clean: %v", err)
+			} else if n > 0 {
+				log.Printf("[report] чистка отчётов: удалено %d", n)
+			}
 			lastClean = time.Now()
 		}
 		select {

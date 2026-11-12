@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS subscription_servers (
 	error     TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (sub_id, server_id)
 );
+-- Отчёты об ошибках из приложения (report.go): лог + описание, хранятся 30 дней
+CREATE TABLE IF NOT EXISTS reports (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	code        TEXT UNIQUE NOT NULL,           -- короткий номер обращения для пользователя/продавца
+	key_id      TEXT NOT NULL,
+	created_at  INTEGER NOT NULL,
+	app_version TEXT NOT NULL DEFAULT '',
+	device      TEXT NOT NULL DEFAULT '',
+	android     TEXT NOT NULL DEFAULT '',
+	transport   TEXT NOT NULL DEFAULT '',
+	last_error  TEXT NOT NULL DEFAULT '',
+	comment     TEXT NOT NULL DEFAULT '',
+	log         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_reports_key ON reports(key_id, id);
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
 `
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)

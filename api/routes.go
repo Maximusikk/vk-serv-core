@@ -27,7 +27,14 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	// Peek: свежий bundle для клиента (master-mode, auth — user_token)
 	reg("/peek", rateLimitMiddleware(s.statusLimiter, s.handleMasterPeek))
 
+	// Отчёты об ошибках: Bearer user_token. До проверки токена — тот же IP-лимит, что у /status
+	// (флуд невалидными токенами не должен упираться в единственное DB-соединение).
+	// Лимит 1 отчёт/5 мин — по КЛЮЧУ, не по IP (из туннеля у всех IP один — IP VPS), см. report.go.
+	reg("/report", rateLimitMiddleware(s.statusLimiter, s.handleReport))
+
 	// Админские (за проверкой X-Admin-Token)
+	reg("/admin/reports", s.adminMiddleware(s.handleAdminListReports))
+	reg("/admin/reports/", s.adminMiddleware(s.handleAdminReport))
 	reg("/admin/keys/create", s.adminMiddleware(s.handleAdminCreateKey))
 	reg("/admin/keys", s.adminMiddleware(s.handleAdminListKeys))
 	reg("/admin/usage", s.adminMiddleware(s.handleAdminUsage)) // 2.2: дельты трафика по курсору

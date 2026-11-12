@@ -18,6 +18,7 @@ type Server struct {
 	activateLimiter  *ipLimiter // /activate по IP (B5)
 	adminAuthLimiter *ipLimiter // неудачных X-Admin-Token по IP (B5)
 	statusLimiter    *ipLimiter // /status и /peek по IP: флуд сюда упирается в единственное DB-соединение
+	reportLimiter    *ipLimiter // POST /report: 1 отчёт на КЛЮЧ за reportRateWin (ключ карты — id ключа, не IP)
 
 	// Этап 3: гистерезис health — подряд неудачных probe по ноде (см. healthDownFails);
 	// чистится на успехе. healthTick выполняется в одной горутине — мьютекс не нужен.
@@ -47,6 +48,7 @@ func NewServer(db *sql.DB, cfg *Config) *Server {
 		activateLimiter:  newIPLimiter(cfg.activateRate(), activateRateWin),
 		adminAuthLimiter: newIPLimiter(adminRateLimit, adminRateWin),
 		statusLimiter:    newIPLimiter(statusRateLimit, statusRateWin),
+		reportLimiter:    newIPLimiter(1, reportRateWin),
 		healthFails:      map[int64]int{},
 		masterHTTP:       &http.Client{Transport: pinnedTransport{}},
 	}
