@@ -453,11 +453,20 @@ func (s *Server) registerSelfNode() error {
 	if capacity <= 0 {
 		capacity = int64(s.cfg.PortEnd - s.cfg.PortStart + 1)
 	}
+	// Имя self-ноды: если владелец переименовал её в реестре (например «Germany»),
+	// не затираем кастомное имя при перерегистрации.
+	name := "self"
+	var existingName string
+	if err := s.db.QueryRow(`SELECT COALESCE(name,'') FROM servers WHERE api = ?`, api).Scan(&existingName); err == nil {
+		if n := strings.TrimSpace(existingName); n != "" && !strings.EqualFold(n, "self") {
+			name = n
+		}
+	}
 	id, err := s.upsertNode(nodeRow{
 		API:         api,
 		Pin:         s.cfg.TLSPin, // пин собственного сертификата; пустой пин = нода self будет down (dialPinned запрещает)
 		MasterToken: s.cfg.MasterToken,
-		Name:        "self",
+		Name:        name,
 		Version:     APIVersion,
 		Capacity:    capacity,
 	})
