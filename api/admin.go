@@ -19,6 +19,14 @@ import (
 // неудачный master-token считается тем же лимитером, что и неудачный admin-token.
 func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Аудит: каждый запрос в /admin/* и /master/* пишется в лог (без тел и самих токенов), см. audit.go
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		w = rec
+		role := "none"
+		token := r.Header.Get("X-Admin-Token")
+		defer func() { auditLog(r, role, token, rec.code(), time.Since(start)) }()
+
 		// D2: опциональный allowlist по IP — до проверки токена (пустой список = разрешено всем)
 		if !s.adminAllowed(r) {
 			jsonError(w, "forbidden", http.StatusForbidden)
@@ -30,11 +38,14 @@ func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			jsonError(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
-		token := r.Header.Get("X-Admin-Token")
 		if !s.tokenAuthorized(token, r.URL.Path) {
 			s.adminAuthLimiter.record(ip)
 			jsonError(w, "unauthorized", http.StatusUnauthorized)
 			return
+		}
+		role = "master"
+		if secretEqual(token, s.cfg.AdminToken) {
+			role = "admin"
 		}
 		next(w, r)
 	}
@@ -63,6 +74,13 @@ func masterTokenAllowed(path string) bool {
 // Allowlist IP и лимитер неудач — те же, что у adminMiddleware.
 func (s *Server) masterTokenMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		w = rec
+		role := "none"
+		token := r.Header.Get("X-Master-Token")
+		defer func() { auditLog(r, role, token, rec.code(), time.Since(start)) }()
+
 		if !s.adminAllowed(r) {
 			jsonError(w, "forbidden", http.StatusForbidden)
 			return
@@ -73,11 +91,12 @@ func (s *Server) masterTokenMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			jsonError(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
-		if !secretEqual(r.Header.Get("X-Master-Token"), s.cfg.MasterToken) {
+		if !secretEqual(token, s.cfg.MasterToken) {
 			s.adminAuthLimiter.record(ip)
 			jsonError(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		role = "master"
 		next(w, r)
 	}
 }

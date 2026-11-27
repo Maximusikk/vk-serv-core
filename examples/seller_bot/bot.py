@@ -1,12 +1,27 @@
-"""Референс-бот продавца VKTurn (Python 3.10+, aiogram 3).
+"""Референс-бот продавца VKTurn в кластерном режиме (Python 3.10+, aiogram 3).
 
-Команды: /buy, /status, /traffic, /extend, /addtraffic, /unbind.
+Бот-мастер поверх нескольких нод VKTurn (этап 2C). Команды: /buy, /status.
 Это ПРИМЕР: оплаты здесь нет. Функция may_purchase() — место, куда продавец подключает
-свою проверку оплаты. По умолчанию покупать (/buy, /extend, /addtraffic) могут только ADMIN_IDS.
+свою проверку оплаты. Покупать (/buy) могут только ADMIN_IDS.
 
 Настройка — переменными окружения (см. README.md). Токены в логи не пишутся.
-API — только HTTPS с проверкой SPKI-пина (VKTURN_ADMIN_PIN, обязателен): токен уходит на
-сервер только после того, как сертификат совпал с пином.
+
+Как работает:
+  /buy <order_id> [дней] [ГБ]
+      → Cluster.create_everywhere(): ключ с одним external_id создаётся на ВСЕХ нодах,
+        локальный стоп-кран (local_limit) на каждой ноде = общий лимит — страховка,
+        если бот упадёт и перестанет отзывать ключи;
+      → хотя бы одна нода удалась → Cluster.bundle(): юзеру отправляется
+        vkturn://bundle-ссылка на все серверы сразу;
+      → частичный успех: ноды с ошибками перечисляются админу;
+      → ни одна не удалась — сообщение об ошибке.
+  Фоновая задача (раз в 60 с):
+      → Cluster.usage_all(): дельты трафика со всех нод по курсорам;
+      → дельты суммируются в локальной SQLite бота (таблица usage);
+      → used >= limit → Cluster.revoke_everywhere() + пометка revoked_at,
+        уведомление админам «Лимит исчерпан, подписка отозвана везде».
+  /status [order] — для админов: сколько нод ответили, used/limit по каждому order,
+      отозван или нет.
 """
 from __future__ import annotations
 
@@ -21,76 +36,107 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
-from vkturn_client import GB, PinMismatchError, VKTurnClient, VKTurnError, parse_pin
+from vkturn_client import GB, Cluster, Node, VKTurnError, parse_pin
 
 log = logging.getLogger("seller_bot")
 
-KEY_RE = re.compile(r"^[0-9a-fA-F]{4}(-[0-9a-fA-F]{4}){3}$")  # xxxx-xxxx-xxxx-xxxx
 ORDER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_DAYS = 3650
 MAX_GB = 100_000
+USAGE_INTERVAL = 60  # сек между заборами дельт
 
 HELP = (
-    "Команды:\n"
-    "/status [ключ] — состояние подписки\n"
-    "/traffic [ключ] — использованный трафик\n"
-    "/unbind [ключ] yes — перенос на другое устройство (раз в 7 дней)\n"
+    "Команды (кластерный режим):\n"
+    "/buy <order_id> [дней] [ГБ] — подписка на все серверы (ГБ=0 — безлимит)\n"
+    "/status [order] — состояние подписок: ноды, used/limit, отозван ли\n"
     "\n"
-    "Для продавца / после оплаты:\n"
-    "/buy <order_id> [дней] [ГБ] — выдать ключ (ГБ=0 — безлимит)\n"
-    "/extend [ключ] [дней] — продлить\n"
-    "/addtraffic [ключ] <ГБ> — докупить трафик"
+    "Оплата подключается в may_purchase() в bot.py."
 )
 
 
 class Config:
     def __init__(self) -> None:
         self.bot_token = os.environ["BOT_TOKEN"]
-        self.api_url = os.environ["VKTURN_API_URL"]
-        self.admin_token = os.environ["VKTURN_ADMIN_TOKEN"]
-        # SPKI-пин сертификата API (VKTURN_ADMIN_PIN= из вывода install.sh / TLS_PIN= в config.txt).
-        # Обязателен: без него бот не стартует (режима «без проверки сертификата» нет).
-        self.admin_pin = parse_pin(os.environ["VKTURN_ADMIN_PIN"])
         self.admin_ids = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
-        self.open_purchases = os.environ.get("OPEN_PURCHASES") == "1"  # только для тестов!
         self.default_days = int(os.environ.get("DEFAULT_DAYS", "30"))
+        self.default_gb = int(os.environ.get("DEFAULT_GB", "10"))
         self.db_path = os.environ.get("DB_PATH", "seller_bot.db")
+        # NODES: список нод через ';', каждая — host:port|pin|MASTER_TOKEN|имя (имя опционально)
+        self.nodes = self._parse_nodes(os.environ.get("NODES", ""))
+
+    @staticmethod
+    def _parse_nodes(spec: str) -> list[Node]:
+        nodes: list[Node] = []
+        for i, chunk in enumerate([c for c in spec.split(";") if c.strip()], 1):
+            parts = [p.strip() for p in chunk.split("|")]
+            if len(parts) not in (3, 4):
+                raise ValueError(
+                    f"NODES: нода #{i} — ожидается host:port|pin|MASTER_TOKEN|имя "
+                    f"(имя опционально), получено {len(parts)} полей")
+            api, pin, token = parts[0], parts[1], parts[2]
+            name = parts[3] if len(parts) == 4 else ""
+            try:
+                nodes.append(Node(api, parse_pin(pin), token, name=name))
+            except ValueError as e:
+                raise ValueError(f"NODES: нода #{i} ({name or api}): {e}") from e
+        return nodes
 
 
 class Store:
-    """Локальная связь «заказ → пользователь Telegram → ключ» (чтобы /status был только у владельца)."""
+    """Локальная база бота: заказы и суммарный трафик по ним (дельты нод складываются здесь)."""
 
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
-        self.db.execute(
-            """CREATE TABLE IF NOT EXISTS keys(
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS orders(
+                 order_id     TEXT PRIMARY KEY,
+                 name         TEXT NOT NULL DEFAULT '',
+                 limit_bytes  INTEGER NOT NULL,
+                 expires_days INTEGER NOT NULL,
+                 created_at   INTEGER NOT NULL,
+                 revoked_at   INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS usage(
                  order_id TEXT PRIMARY KEY,
-                 tg_user_id INTEGER NOT NULL,
-                 key_id TEXT NOT NULL UNIQUE,
-                 created_at INTEGER NOT NULL)"""
-        )
+                 used     INTEGER NOT NULL DEFAULT 0);
+        """)
         self.db.commit()
 
-    def order_owner(self, order_id: str) -> int | None:
-        row = self.db.execute("SELECT tg_user_id FROM keys WHERE order_id = ?", (order_id,)).fetchone()
-        return row[0] if row else None
-
-    def add(self, order_id: str, uid: int, key_id: str) -> None:
+    def add_order(self, order_id: str, name: str, limit_bytes: int, expires_days: int) -> None:
         self.db.execute(
-            "INSERT OR IGNORE INTO keys(order_id, tg_user_id, key_id, created_at) VALUES (?,?,?,?)",
-            (order_id, uid, key_id, int(time.time())),
-        )
+            "INSERT OR IGNORE INTO orders(order_id, name, limit_bytes, expires_days, created_at) "
+            "VALUES (?,?,?,?,?)", (order_id, name, limit_bytes, expires_days, int(time.time())))
+        self.db.execute("INSERT OR IGNORE INTO usage(order_id, used) VALUES (?, 0)", (order_id,))
         self.db.commit()
 
-    def keys_of(self, uid: int) -> list[str]:
-        rows = self.db.execute(
-            "SELECT key_id FROM keys WHERE tg_user_id = ? ORDER BY created_at DESC, rowid DESC", (uid,)
-        ).fetchall()
-        return [r[0] for r in rows]
+    def add_used(self, order_id: str, nbytes: int) -> int:
+        self.db.execute("UPDATE usage SET used = used + ? WHERE order_id = ?", (nbytes, order_id))
+        self.db.commit()
+        return self.used(order_id)
 
-    def key_owner(self, key_id: str) -> int | None:
-        row = self.db.execute("SELECT tg_user_id FROM keys WHERE key_id = ?", (key_id,)).fetchone()
-        return row[0] if row else None
+    def used(self, order_id: str) -> int:
+        row = self.db.execute("SELECT used FROM usage WHERE order_id = ?", (order_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def order(self, order_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT order_id, name, limit_bytes, expires_days, created_at, revoked_at "
+            "FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        if not row:
+            return None
+        return dict(zip(("order_id", "name", "limit_bytes", "expires_days",
+                         "created_at", "revoked_at"), row))
+
+    def orders(self) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT order_id, name, limit_bytes, expires_days, created_at, revoked_at "
+            "FROM orders ORDER BY created_at DESC").fetchall()
+        return [dict(zip(("order_id", "name", "limit_bytes", "expires_days",
+                          "created_at", "revoked_at"), r)) for r in rows]
+
+    def mark_revoked(self, order_id: str) -> None:
+        self.db.execute("UPDATE orders SET revoked_at = ? WHERE order_id = ?",
+                        (int(time.time()), order_id))
+        self.db.commit()
 
 
 def fmt_bytes(n: int) -> str:
@@ -110,58 +156,7 @@ def to_int(s: str, lo: int, hi: int) -> int | None:
     return v if lo <= v <= hi else None
 
 
-def split_args(raw: str | None) -> tuple[str | None, list[str]]:
-    """Выделяет необязательный ключ из аргументов команды; остальное — позиционные аргументы."""
-    key, rest = None, []
-    for tok in (raw or "").split():
-        if key is None and KEY_RE.match(tok):
-            key = tok.lower()
-        else:
-            rest.append(tok)
-    return key, rest
-
-
-def explain(e: VKTurnError) -> str:
-    if isinstance(e, PinMismatchError):
-        # Токен не отправлен. Либо сертификат сервера сменили (rotate-cert.sh --new-key),
-        # либо соединение перехвачено. Пин в логе не секрет; токен не пишем.
-        log.error("TLS pin mismatch: expected %s, server presented %s", e.expected, e.actual)
-        return "Сервер VKTurn сейчас недоступен. Попробуйте позже."
-    if e.status == 0:
-        return "Сервер VKTurn сейчас недоступен. Попробуйте позже."
-    if e.status == 404:
-        return "Ключ не найден."
-    if e.status == 429:
-        return "Слишком часто. Для переноса на другое устройство — не чаще раза в 7 дней."
-    if e.status in (401, 403):
-        return "Сервер отклонил запрос бота (проверьте VKTURN_ADMIN_TOKEN / -admin-allow)."
-    if e.status == 400:
-        return f"Некорректный запрос: {e.message}"
-    log.warning("API error: %s", e)
-    return "Ошибка сервера VKTurn. Попробуйте позже."
-
-
-def describe(k: dict) -> str:
-    lines = [f"Ключ: {k.get('id', '?')}"]
-    days_left = k.get("days_left", -1)
-    if k.get("revoked_at") or k.get("status") == "revoked":
-        lines.append("Статус: отозван продавцом")
-    elif not k.get("activated_at"):
-        if days_left and days_left > 0:
-            lines.append(f"Статус: не активирован. Срок {days_left} дн. начнётся с первой активации.")
-        else:
-            lines.append("Статус: не активирован (бессрочный).")
-    elif k.get("active"):
-        lines.append("Статус: активен, " + ("бессрочно" if days_left < 0 else f"осталось {days_left} дн."))
-    else:
-        lines.append("Статус: истёк срок или исчерпан трафик — продлите или докупите ГБ.")
-    used, limit = int(k.get("bytes_used", 0) or 0), int(k.get("bytes_limit", 0) or 0)
-    lines.append(f"Трафик: {fmt_bytes(used)} из " + (fmt_bytes(limit) if limit else "безлимита"))
-    lines.append("Устройство: " + ("привязано" if k.get("device_bound") else "не привязано"))
-    return "\n".join(lines)
-
-
-def build_router(cfg: Config, api: VKTurnClient, store: Store) -> Router:
+def build_router(cfg: Config, cluster: Cluster, store: Store, bot: Bot) -> Router:
     r = Router()
 
     def is_admin(uid: int) -> bool:
@@ -169,17 +164,14 @@ def build_router(cfg: Config, api: VKTurnClient, store: Store) -> Router:
 
     def may_purchase(uid: int) -> bool:
         """ПОДКЛЮЧИТЕ ОПЛАТУ ЗДЕСЬ: вернуть True, только если пользователь реально оплатил."""
-        return cfg.open_purchases or is_admin(uid)
+        return is_admin(uid)
 
-    def pick_key(uid: int, key: str | None) -> tuple[str | None, str | None]:
-        if key:
-            if is_admin(uid) or store.key_owner(key) == uid:
-                return key, None
-            return None, "Ключ не найден."  # не раскрываем, существует ли чужой ключ
-        keys = store.keys_of(uid)
-        if not keys:
-            return None, "У вас пока нет ключей."
-        return keys[0], None
+    async def notify_admins(text: str) -> None:
+        for uid in cfg.admin_ids:
+            try:
+                await bot.send_message(uid, text)
+            except Exception as e:  # телеграм может недоступен — не падаем
+                log.warning("notify_admins(%s): %s", uid, e)
 
     @r.message(Command("start", "help"))
     async def cmd_help(m: Message) -> None:
@@ -198,161 +190,146 @@ def build_router(cfg: Config, api: VKTurnClient, store: Store) -> Router:
             return
         order_id = parts[0]
         days = to_int(parts[1], 1, MAX_DAYS) if len(parts) > 1 else cfg.default_days
-        gb = to_int(parts[2], 0, MAX_GB) if len(parts) > 2 else 0
+        gb = to_int(parts[2], 0, MAX_GB) if len(parts) > 2 else cfg.default_gb
         if days is None or gb is None:
             await m.answer(usage)
             return
-        owner = store.order_owner(order_id)
-        if owner is not None and owner != uid and not is_admin(uid):
-            await m.answer("Этот заказ уже оформлен на другого пользователя.")
+        limit_bytes = gb * GB
+        old = store.order(order_id)
+        if old and old["revoked_at"]:
+            await m.answer("Этот заказ уже отозван. Используйте новый order_id.")
             return
+        # Один external_id на все ноды; local_limit = общий лимит — стоп-кран ноды на случай
+        # пропажи мастера (бот упал — нода сама остановит трафик).
+        res = await cluster.create_everywhere(order_id, bytes_limit=limit_bytes,
+                                              local_limit=limit_bytes, expires_days=days)
+        ok = {api: r for api, r in res.items() if "key" in r}
+        failed = {api: r["error"] for api, r in res.items() if "error" in r}
+        if not ok:
+            await m.answer("Не удалось создать подписку ни на одной ноде: "
+                           + "; ".join(f"{api}: {err}" for api, err in failed.items()))
+            return
+        # Частичный успех: создаём то, что есть, добираем при следующем /buy с тем же order
+        # (идемпотентно). Store дополняем актуальными значениями.
+        name = old["name"] if old else order_id
+        store.add_order(order_id, name, limit_bytes, days)
         try:
-            res = await api.create_key(external_id=order_id, days=days, bytes_limit=gb * GB, notes=f"tg:{uid}")
-        except VKTurnError as e:
-            await m.answer(explain(e))
+            link = cluster.bundle(order_id, name)
+        except KeyError:
+            await m.answer("Внутренняя ошибка: ключи созданы, но bundle не собрался. См. лог.")
             return
-        key_id = str(res["key"]).lower()
-        if res.get("duplicate") and owner is None and not is_admin(uid):
-            # Заказ уже есть на сервере, но не в локальной базе бота — не отдаём чужой ключ.
-            await m.answer("Заказ уже обработан ранее. Обратитесь к продавцу.")
-            return
-        if owner is None:
-            store.add(order_id, uid, key_id)
-        text = ["Ваш ключ готов." if not res.get("duplicate") else "Ключ по этому заказу уже выдан (повтор)."]
-        text.append(f"Ссылка для приложения:\n{res.get('link', '')}")
-        if res.get("duration_days"):
-            text.append(f"Срок {res['duration_days']} дн. начнётся с первой активации в приложении.")
-        await m.answer("\n\n".join(text))
+        if failed:
+            await notify_admins(
+                f"/buy {order_id}: частичный успех, ноды с ошибками:\n"
+                + "\n".join(f"• {api}: {err}" for api, err in failed.items()))
+        lines = ["Ссылка для приложения (вставьте целиком):",
+                 f"`{link}`",
+                 f"Подписка «{name}»: серверов {len(ok)}/{len(cluster.nodes)}, "
+                 f"лимит {fmt_bytes(limit_bytes)}, срок {days} дн. (с первой активации)."]
+        await m.answer("\n".join(lines), parse_mode="Markdown")
 
     @r.message(Command("status"))
     async def cmd_status(m: Message, command: CommandObject) -> None:
-        key_arg, _ = split_args(command.args)
-        key_id, err = pick_key(m.from_user.id, key_arg)
-        if err:
-            await m.answer(err)
+        if not is_admin(m.from_user.id):
+            await m.answer("Только для админов.")
             return
-        try:
-            await m.answer(describe(await api.get_key(key_id)))
-        except VKTurnError as e:
-            await m.answer(explain(e))
-
-    @r.message(Command("traffic"))
-    async def cmd_traffic(m: Message, command: CommandObject) -> None:
-        key_arg, _ = split_args(command.args)
-        key_id, err = pick_key(m.from_user.id, key_arg)
-        if err:
-            await m.answer(err)
+        arg = (command.args or "").split()
+        orders = [o for o in store.orders() if not arg or o["order_id"] == arg[0]]
+        if not orders:
+            await m.answer("Заказы не найдены.")
             return
-        try:
-            k = await api.get_key(key_id)
-        except VKTurnError as e:
-            await m.answer(explain(e))
-            return
-        used, limit = int(k.get("bytes_used", 0) or 0), int(k.get("bytes_limit", 0) or 0)
-        if limit:
-            await m.answer(f"Использовано {fmt_bytes(used)} из {fmt_bytes(limit)}, "
-                           f"осталось {fmt_bytes(max(limit - used, 0))}.")
-        else:
-            await m.answer(f"Использовано {fmt_bytes(used)}. Лимита нет.")
-
-    @r.message(Command("extend"))
-    async def cmd_extend(m: Message, command: CommandObject) -> None:
-        uid = m.from_user.id
-        if not may_purchase(uid):
-            await m.answer("Оплата ещё не подтверждена. Обратитесь к продавцу.")
-            return
-        key_arg, rest = split_args(command.args)
-        days = to_int(rest[0], 1, MAX_DAYS) if rest else cfg.default_days
-        if days is None:
-            await m.answer(f"Использование: /extend [ключ] [дней 1..{MAX_DAYS}]")
-            return
-        key_id, err = pick_key(uid, key_arg)
-        if err:
-            await m.answer(err)
-            return
-        try:
-            # PATCH expires_days у бессрочного ключа ставит срок от сегодня и убирает бессрочность.
-            if (await api.get_key(key_id)).get("days_left") == -1:
-                await m.answer("Ключ бессрочный, продлевать нечего.")
-                return
-            res = await api.extend(key_id, days)
-        except VKTurnError as e:
-            await m.answer(explain(e))
-            return
-        msg = f"Продлено на {days} дн."
-        if res.get("new_port"):
-            msg += " Доступ восстановлен — приложение переподключится само, вводить ключ заново не нужно."
-        await m.answer(msg)
-
-    @r.message(Command("addtraffic"))
-    async def cmd_addtraffic(m: Message, command: CommandObject) -> None:
-        uid = m.from_user.id
-        if not may_purchase(uid):
-            await m.answer("Оплата ещё не подтверждена. Обратитесь к продавцу.")
-            return
-        key_arg, rest = split_args(command.args)
-        gb = to_int(rest[0], 1, MAX_GB) if rest else None
-        if gb is None:
-            await m.answer("Использование: /addtraffic [ключ] <ГБ>")
-            return
-        key_id, err = pick_key(uid, key_arg)
-        if err:
-            await m.answer(err)
-            return
-        try:
-            res = await api.add_traffic(key_id, gb * GB)
-        except VKTurnError as e:
-            await m.answer(explain(e))  # напр. 400 для безлимитного ключа
-            return
-        msg = f"Добавлено {gb} ГБ."
-        if res.get("new_port"):
-            msg += " Доступ восстановлен — приложение переподключится само."
-        await m.answer(msg)
-
-    @r.message(Command("unbind"))
-    async def cmd_unbind(m: Message, command: CommandObject) -> None:
-        key_arg, rest = split_args(command.args)
-        key_id, err = pick_key(m.from_user.id, key_arg)
-        if err:
-            await m.answer(err)
-            return
-        if not rest or rest[0].lower() != "yes":
-            await m.answer(
-                "Старая привязка и конфиги перестанут работать; снова можно не раньше чем через 7 дней.\n"
-                "Подтвердите: /unbind yes  (или /unbind <ключ> yes)"
-            )
-            return
-        try:
-            await api.unbind(key_id)
-        except VKTurnError as e:
-            await m.answer(explain(e))
-            return
-        await m.answer("Готово. Вставьте ту же ссылку-ключ в приложении на новом устройстве.")
+        # Сколько нод сейчас отвечают (health-проверка, не считается ошибкой бота).
+        alive = 0
+        for node in cluster.nodes:
+            try:
+                await node.health()
+                alive += 1
+            except Exception as e:
+                log.warning("health %s: %s", node.api, e)
+        lines = [f"Нод в кластере: {len(cluster.nodes)}, отвечают: {alive}."]
+        for o in orders:
+            used = store.used(o["order_id"])
+            limit = o["limit_bytes"]
+            st = ", отозван" if o["revoked_at"] else ""
+            lines.append(f"• {o['order_id']} «{o['name']}»: "
+                         f"{fmt_bytes(used)} / " + ("безлимит" if not limit else fmt_bytes(limit))
+                         + f", срок {o['expires_days']} дн.{st}")
+        await m.answer("\n".join(lines))
 
     return r
 
 
+async def usage_loop(cfg: Config, cluster: Cluster, store: Store, bot: Bot) -> None:
+    """Каждые USAGE_INTERVAL сек забирает дельты со всех нод и складывает в локальную БД.
+    При исчерпании лимита — revoke_everywhere + пометка + уведомление админам."""
+    log.info("usage loop: интервал %s с", USAGE_INTERVAL)
+    while True:
+        await asyncio.sleep(USAGE_INTERVAL)
+        try:
+            totals = await cluster.usage_all()
+        except Exception as e:  # задача не должна умирать
+            log.warning("usage_all: %s", e)
+            continue
+        for order_id, delta in totals.items():
+            if delta <= 0 or not order_id:
+                continue
+            try:
+                used = store.add_used(order_id, delta)
+                o = store.order(order_id)
+                if o is None or o["revoked_at"]:
+                    continue
+                limit = o["limit_bytes"]
+                log.info("usage %s: +%s, всего %s / %s", order_id, fmt_bytes(delta),
+                         fmt_bytes(used), fmt_bytes(limit) if limit else "безлимит")
+                if limit and used >= limit:
+                    log.warning("order %s: лимит исчерпан, отзываю везде", order_id)
+                    res = await cluster.revoke_everywhere(order_id)
+                    store.mark_revoked(order_id)
+                    errs = [f"{api}: {r['error']}" for api, r in res.items() if "error" in r]
+                    msg = f"Лимит исчерпан, подписка «{o['name'] or order_id}» отозвана везде."
+                    if errs:
+                        msg += "\nОшибки отзыва:\n" + "\n".join(f"• {e}" for e in errs)
+                    await _notify(cfg, bot, msg)
+            except Exception as e:
+                log.warning("usage apply %s: %s", order_id, e)
+
+
+async def _notify(cfg: Config, bot: Bot, text: str) -> None:
+    for uid in cfg.admin_ids:
+        try:
+            await bot.send_message(uid, text)
+        except Exception as e:
+            log.warning("notify(%s): %s", uid, e)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Токены и пины в лог не попадают: Node/Cluster их не логируют, здесь тоже не печатаем.
     try:
         cfg = Config()
     except KeyError as e:
         raise SystemExit(f"Не задана переменная окружения {e.args[0]} (см. README.md)")
     except ValueError as e:
         raise SystemExit(f"Неверная настройка: {e}")
-    try:
-        api = VKTurnClient(cfg.api_url, cfg.admin_token, pin=cfg.admin_pin)
-    except ValueError as e:
-        raise SystemExit(f"Неверная настройка: {e}")
+    if not cfg.nodes:
+        raise SystemExit("NODES не задан или пуст — кластерный боту нечего обслуживать (см. README.md)")
+    log.info("нод в кластере: %d", len(cfg.nodes))
+    cluster = Cluster(cfg.nodes, db_path=cfg.db_path)
     store = Store(cfg.db_path)
     bot = Bot(cfg.bot_token)
     dp = Dispatcher()
-    dp.include_router(build_router(cfg, api, store))
+    dp.include_router(build_router(cfg, cluster, store, bot))
+    task = asyncio.create_task(usage_loop(cfg, cluster, store, bot))
     try:
         await dp.start_polling(bot)
     finally:
-        await api.close()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
+        cluster.close()
 
 
 if __name__ == "__main__":

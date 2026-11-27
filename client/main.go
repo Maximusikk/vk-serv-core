@@ -62,6 +62,7 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	setupGlobalResolver()
+	setupNat64()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,8 +130,12 @@ func main() {
 	vkAuthMode := flag.String("vk-auth", "anonymous", "режим VK авторизации (account/anonymous)")
 	vkAnonPath := flag.String("vk-anon-path", "vkcalls", "анонимный путь VK TURN (vkcalls/legacy)")
 	vkCredsFile := flag.String("vk-creds-file", "", "файл с TURN кредами от аккаунта VK")
+	authVia := flag.String("authvia", "", "URL API для реле VK-авторизации (когда VK задушен)")
+	authViaToken := flag.String("authvia-token", "", "user_token для реле VK-авторизации")
+	authViaPin := flag.String("authvia-pin", "", "SPKI-пин API для реле (hex64)")
 
 	flag.Parse()
+	setAuthVia(*authVia, *authViaToken, *authViaPin)
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
 	activeVkAuthMode := setVkAuthMode(*vkAuthMode)
 	activeVkAnonPath := setVkAnonPath(*vkAnonPath)
@@ -151,6 +156,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[КЛИЕНТ] Ошибка разбора пира: %v", err)
 	}
+	peer = nat64UDP(peer) // IPv6-only сеть → пир через NAT64-синтез
 
 	hashes := ParseHashes(*vkHash)
 	if len(hashes) == 0 {

@@ -93,6 +93,7 @@ func RunSession(
 	if err != nil {
 		return false, fmt.Errorf("резолв TURN: %w", err)
 	}
+	resolved = nat64UDP(resolved) // IPv6-only сеть → TURN через NAT64-синтез
 	c, err := net.DialUDP("udp", nil, resolved)
 	if err != nil {
 		return false, fmt.Errorf("подключение TURN UDP: %w", err)
@@ -453,6 +454,7 @@ func RunPing(
 	if err != nil {
 		return 0, err
 	}
+	resolved = nat64UDP(resolved) // IPv6-only сеть → TURN через NAT64-синтез
 	c, err := net.DialUDP("udp", nil, resolved)
 	if err != nil {
 		return 0, err

@@ -15,10 +15,13 @@ type Server struct {
 	// иначе параллельные активации получают один и тот же порт.
 	provisionMu sync.Mutex
 
-	activateLimiter  *ipLimiter // /activate по IP (B5)
-	adminAuthLimiter *ipLimiter // неудачных X-Admin-Token по IP (B5)
-	statusLimiter    *ipLimiter // /status и /peek по IP: флуд сюда упирается в единственное DB-соединение
-	reportLimiter    *ipLimiter // POST /report: 1 отчёт на КЛЮЧ за reportRateWin (ключ карты — id ключа, не IP)
+	activateLimiter        *ipLimiter // /activate по IP (B5)
+	activateKeyLimiter     *ipLimiter // /activate с loopback (загрузочный канал): по ключу
+	activateUnknownLimiter *ipLimiter // /activate с loopback и неизвестным ключом: общий бакет
+	adminAuthLimiter       *ipLimiter // неудачных X-Admin-Token по IP (B5)
+	statusLimiter          *ipLimiter // /status и /peek по IP: флуд сюда упирается в единственное DB-соединение
+	reportLimiter          *ipLimiter // POST /report: 1 отчёт на КЛЮЧ за reportRateWin (ключ карты — id ключа, не IP)
+	vkauthLimiter          *ipLimiter // POST /vkauth: vkauthRateMax на КЛЮЧ за vkauthRateWin
 
 	// Этап 3: гистерезис health — подряд неудачных probe по ноде (см. healthDownFails);
 	// чистится на успехе. healthTick выполняется в одной горутине — мьютекс не нужен.
@@ -43,14 +46,17 @@ type Server struct {
 // NewServer создаёт Server поверх открытой БД.
 func NewServer(db *sql.DB, cfg *Config) *Server {
 	s := &Server{
-		db:               db,
-		cfg:              cfg,
-		activateLimiter:  newIPLimiter(cfg.activateRate(), activateRateWin),
-		adminAuthLimiter: newIPLimiter(adminRateLimit, adminRateWin),
-		statusLimiter:    newIPLimiter(statusRateLimit, statusRateWin),
-		reportLimiter:    newIPLimiter(1, reportRateWin),
-		healthFails:      map[int64]int{},
-		masterHTTP:       &http.Client{Transport: pinnedTransport{}},
+		db:                     db,
+		cfg:                    cfg,
+		activateLimiter:        newIPLimiter(cfg.activateRate(), activateRateWin),
+		activateKeyLimiter:     newIPLimiter(activateKeyLimit, activateRateWin),
+		activateUnknownLimiter: newIPLimiter(activateUnknownLimit, activateRateWin),
+		adminAuthLimiter:       newIPLimiter(adminRateLimit, adminRateWin),
+		statusLimiter:          newIPLimiter(statusRateLimit, statusRateWin),
+		reportLimiter:          newIPLimiter(1, reportRateWin),
+		vkauthLimiter:          newIPLimiter(vkauthRateMax, vkauthRateWin),
+		healthFails:            map[int64]int{},
+		masterHTTP:             &http.Client{Transport: pinnedTransport{}},
 	}
 	s.notifyPortDown = s.sendPortDownWebhook
 	// 2.5: реальная реализация вебхуков событий ключа

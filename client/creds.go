@@ -245,6 +245,15 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 	}
 
 	if time.Now().Unix() < globalCaptchaLockout.Load() {
+		// Капченый lockout душит только локальные цепочки; серверное реле
+		// ходит с чистой сессии без капчи — пробуем его вместо ожидания.
+		if authViaConfigured() {
+			if u, p, a, err := fetchVkCredsViaServer(ctx, streamID); err == nil {
+				return u, p, a, nil
+			} else {
+				log.Printf("[STREAM %d] [VK Auth] Relay during lockout failed: %v", streamID, err)
+			}
+		}
 		return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
 	}
 
@@ -255,6 +264,14 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 			return user, pass, addrs, nil
 		}
 		log.Printf("[STREAM %d] [VK Auth] VK Calls path failed (%s), falling back to legacy", streamID, describeVKCallsFailure(err))
+		// VK задушен/недоступен локально — не ждём legacy-переборы, сразу реле.
+		if authViaConfigured() && authViaWorthTrying(err) {
+			if u, p, a, rerr := fetchVkCredsViaServer(ctx, streamID); rerr == nil {
+				return u, p, a, nil
+			} else {
+				log.Printf("[STREAM %d] [VK Auth] Relay failed: %v", streamID, rerr)
+			}
+		}
 	} else {
 		log.Printf("[STREAM %d] [VK Auth] Legacy path selected, skipping VK Calls", streamID)
 	}
@@ -292,6 +309,15 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 				return "", "", nil, ctx.Err()
 			case <-time.After(wait):
 			}
+		}
+	}
+
+	// Последний шанс — серверное реле (legacy тоже провалился).
+	if authViaConfigured() {
+		if u, p, a, rerr := fetchVkCredsViaServer(ctx, streamID); rerr == nil {
+			return u, p, a, nil
+		} else {
+			log.Printf("[STREAM %d] [VK Auth] Final relay failed: %v", streamID, rerr)
 		}
 	}
 

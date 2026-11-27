@@ -15,7 +15,7 @@ warn()  { echo -e "${Y}[!]${N} $*"; }
 error() { echo -e "${R}[✗]${N} $*"; exit 1; }
 step()  { echo -e "\n${W}━━━ $* ━━━${N}"; }
 
-VKSERV_VERSION="${VKSERV_VERSION:-v1.4.0-server-binary}"
+VKSERV_VERSION="${VKSERV_VERSION:-v1.4.1-server-binary}"
 VKSERV_REPO="https://github.com/Maximusikk/vk-serv-core/releases/download/$VKSERV_VERSION"
 INSTALL_DIR="/opt/vkturn"
 LOG_DIR="/var/log/vkturn"

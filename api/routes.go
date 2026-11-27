@@ -20,7 +20,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	})
 
 	// Публичные (/activate ограничен по IP — B5)
-	reg("/activate", rateLimitMiddleware(s.activateLimiter, s.handleActivate))
+	reg("/activate", s.activateLimitMiddleware(s.handleActivate))
 	// /status и /peek дёргают SQLite (MaxOpenConns(1)) — без лимита дешёвый флуд
 	// вешает и активацию, и админку.
 	reg("/status", rateLimitMiddleware(s.statusLimiter, s.handleStatus))
@@ -31,6 +31,11 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	// (флуд невалидными токенами не должен упираться в единственное DB-соединение).
 	// Лимит 1 отчёт/5 мин — по КЛЮЧУ, не по IP (из туннеля у всех IP один — IP VPS), см. report.go.
 	reg("/report", rateLimitMiddleware(s.statusLimiter, s.handleReport))
+
+	// Реле VK-авторизации (для сетей, где VK HTTPS задушен): Bearer user_token.
+	// До проверки токена — IP-лимит /status (флуд невалидными токенами не должен
+	// упираться в единственное DB-соединение), после — vkauthLimiter по ключу.
+	reg("/vkauth", rateLimitMiddleware(s.statusLimiter, s.handleVKAuth))
 
 	// Админские (за проверкой X-Admin-Token)
 	reg("/admin/reports", s.adminMiddleware(s.handleAdminListReports))

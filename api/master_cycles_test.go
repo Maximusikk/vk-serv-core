@@ -319,7 +319,9 @@ func TestMasterHealthCycle(t *testing.T) {
 	s.cfg.NotifyURL = hook.URL
 	nodeID := addTestNode(t, s, "n4.example:7000")
 
-	s.healthTick() // active → down
+	for i := 0; i < healthDownFails; i++ { // active → down (после healthDownFails подряд)
+		s.healthTick()
+	}
 	var status string
 	s.db.QueryRow(`SELECT status FROM servers WHERE id=?`, nodeID).Scan(&status)
 	if status != "down" {

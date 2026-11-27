@@ -4,8 +4,12 @@ package main
 // Достаточно для одного сервера; состояние в памяти, сброс при рестарте API допустим.
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -101,7 +105,7 @@ const (
 	activateRateWin   = time.Minute
 	adminRateLimit    = 10
 	adminRateWin      = time.Minute
-	statusRateLimit   = 120 // /status и /peek: дешёвый флуд сюда упирается в
+	statusRateLimit   = 120         // /status и /peek: дешёвый флуд сюда упирается в
 	statusRateWin     = time.Minute // единственное DB-соединение (MaxOpenConns(1))
 )
 
@@ -111,6 +115,60 @@ func (c *Config) activateRate() int {
 		return activateRateLimit
 	}
 	return c.ActivateRate
+}
+
+const (
+	activateKeyLimit     = 10 // /activate с одного ключа в минуту (загрузочный канал, loopback)
+	activateUnknownLimit = 30 // /activate с неизвестными ключами через loopback — один общий бакет
+)
+
+func isLoopbackIP(ip string) bool {
+	p := net.ParseIP(ip)
+	return p != nil && p.IsLoopback()
+}
+
+// activateLimitMiddleware — лимит /activate.
+// Обычные запросы — по IP, как раньше. Запросы из загрузочного канала (hy2-boot на этом же
+// сервере) приходят с loopback, поэтому лимит по IP стал бы общим на всех клиентов канала.
+// Для них лимит по КЛЮЧУ из тела: валидный ключ упирается только в свой бакет, а мусор
+// (неизвестные ключи) делит один общий бакет и не может вытеснить честных владельцев ключей.
+func (s *Server) activateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	ipMw := rateLimitMiddleware(s.activateLimiter, next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.activateKeyLimiter == nil || s.activateUnknownLimiter == nil || !isLoopbackIP(clientIP(r)) {
+			ipMw(w, r)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+		if err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var req struct {
+			Key string `json:"key"`
+		}
+		_ = json.Unmarshal(body, &req)
+		key := strings.ToLower(strings.TrimSpace(req.Key))
+
+		known := false
+		if key != "" && s.db != nil {
+			var one int
+			known = s.db.QueryRow(`SELECT 1 FROM keys WHERE id = ?`, key).Scan(&one) == nil
+		}
+		var ok bool
+		if known {
+			ok = s.activateKeyLimiter.allow("k:" + key)
+		} else {
+			ok = s.activateUnknownLimiter.allow("unknown")
+		}
+		if !ok {
+			w.Header().Set("Retry-After", "60")
+			jsonErrorCode(w, "Слишком много попыток — подожди минуту", "rate_limited", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // rateLimitMiddleware ограничивает частоту запросов с одного IP.

@@ -201,6 +201,20 @@ func (s *Server) handleMasterJoin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "db error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 3.9: новая нода попадает во все активные подписки как pending.
+	// dispatchSubscription помечает ноды только при СОЗДАНИИ подписки, поэтому
+	// нода, добавленная позже, оставалась бы без ключей навсегда: досыл (resendTick)
+	// ходит только по существующим строкам subscription_servers. Пометили pending —
+	// досыл (30 с) сам создаст ключи на ноде: срок берётся из любой активной
+	// доставки (restoreExpiresDays), лимит — из подписки.
+	if res, err := s.db.Exec(`
+		INSERT INTO subscription_servers (sub_id, server_id, status)
+		SELECT id, ?, 'pending' FROM subscriptions WHERE revoked_at IS NULL
+		ON CONFLICT(sub_id, server_id) DO NOTHING`, id); err != nil {
+		log.Printf("[master] нода %s: не пометить подписки: %v", req.API, err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("[master] нода %s: добавлена в %d активных подписок (pending, досыл ~30 с)", req.API, n)
+	}
 	log.Printf("[master] нода зарегистрирована: %s (%s)", req.API, req.Name)
 	jsonOK(w, map[string]any{"status": "registered", "server_id": id})
 }
